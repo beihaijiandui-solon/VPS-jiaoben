@@ -1,0 +1,1891 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+BASE_DIR="${VPS_GATEWAY_BASE:-/etc/vps-gateway}"
+LOG_DIR="${VPS_GATEWAY_LOG:-/var/log/vps-gateway}"
+NGINX_DIR="/etc/nginx"
+NGINX_STREAM_DIR="/etc/nginx/stream.d"
+NGINX_HTTP_DIR="/etc/nginx/conf.d"
+REALITY_CONF_DEFAULT="/etc/nginx/stream-conf.d/reality443.conf"
+SSH_DROPIN="/etc/ssh/sshd_config.d/99-vps-gateway.conf"
+
+DRY_RUN=0
+VERBOSE=0
+ASSUME_YES=0
+COMMAND=""
+ARGS=()
+
+umask 077
+
+on_error() {
+  local exit_code=$?
+  local line_no=${1:-unknown}
+  log "ERROR" "命令在第 ${line_no} 行执行失败；退出码=${exit_code}"
+  exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
+on_interrupt() {
+  printf '\n已取消操作，正在退出。\n' >&2
+  exit 130
+}
+trap on_interrupt INT
+
+usage() {
+  cat <<'EOF'
+VPS Gateway - 模块化 VPS 安全与 TCP 443 网关管理工具
+
+用法：
+  vps-gateway                         进入中文管理面板
+  vps-gateway menu                    进入中文管理面板
+  vps-gateway help                    查看本帮助
+  vps-gateway [全局选项] <子命令> [参数]
+
+全局选项：
+  --dry-run                           只预览将要执行的动作，不修改系统
+  --verbose                           显示更详细的执行信息
+  --yes, -y                           跳过普通确认；高危操作仍会做安全检查
+  --help, -h                          查看本帮助
+
+常用命令示例：
+  vps-gateway doctor                  执行系统自检与安全评分
+  vps-gateway install-deps --minimal  只安装最小依赖
+  vps-gateway reality-menu            管理 Reality SNI 路由
+  vps-gateway reality-route-list      查看 Reality SNI 路由
+  vps-gateway route-list              查看内层 Nginx SNI 路由
+  vps-gateway cert-status             查看证书状态
+  vps-gateway docker-check-exposure   检查 Docker 公网端口暴露
+  vps-gateway firewall-stage          分阶段收紧防火墙
+  vps-gateway rollback-status         查看待确认的自动回滚
+
+高危操作提醒：
+  1. 不要让 OpenSSH 和 Nginx 同时直接监听公网 443。
+  2. 未验证 SSH over 443 前，不要关闭公网 22。
+  3. SSH、Nginx、防火墙、证书等高危模块会先备份并安排自动回滚。
+  4. Reality 已占用 443 时，请使用 reality-* 命令管理路由，不要强行执行 gateway-install。
+
+关键路径：
+  配置目录：/etc/vps-gateway
+  日志目录：/var/log/vps-gateway
+  主程序：  /usr/local/bin/vps-gateway
+  Reality： /etc/nginx/stream-conf.d/reality443.conf
+EOF
+}
+
+parse_global_args() {
+  while (($#)); do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      --verbose) VERBOSE=1; shift ;;
+      --yes|-y) ASSUME_YES=1; shift ;;
+      --help|-h|help) COMMAND="help"; shift; ARGS=("$@"); return ;;
+      *) COMMAND="$1"; shift; ARGS=("$@"); return ;;
+    esac
+  done
+  COMMAND="menu"
+  ARGS=()
+}
+
+log_file_for_level() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s/main.log' "$LOG_DIR"
+}
+
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  local label="$level"
+  local lf
+  case "$level" in
+    INFO) label="信息" ;;
+    WARN) label="警告" ;;
+    ERROR) label="错误" ;;
+  esac
+  ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+  lf="$(log_file_for_level)"
+  if [[ -d "$(dirname "$lf")" && -w "$(dirname "$lf")" ]]; then
+    printf '[%s] [%s] %s\n' "$ts" "$label" "$msg" | tee -a "$lf" >&2 || true
+  else
+    printf '[%s] [%s] %s\n' "$ts" "$label" "$msg" >&2
+  fi
+}
+
+info() { log "INFO" "$*"; }
+warn() { log "WARN" "$*"; }
+die() { log "ERROR" "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+color_enabled() {
+  [[ -t 1 && -z "${NO_COLOR:-}" ]]
+}
+
+color() {
+  local code="$1"
+  if color_enabled; then
+    printf '\033[%sm' "$code"
+  fi
+  return 0
+}
+
+color_reset() {
+  if color_enabled; then
+    printf '\033[0m'
+  fi
+  return 0
+}
+
+ui_line() {
+  printf '════════════════════════════════════════════\n'
+}
+
+print_banner() {
+  local title="$1"
+  printf '\n'
+  color "1;36"; ui_line; color_reset
+  printf '        %s\n' "$title"
+  color "1;36"; ui_line; color_reset
+  printf '\n'
+}
+
+print_section() {
+  local title="$1"
+  color "1;34"; printf '\n【%s】\n' "$title"; color_reset
+}
+
+print_menu_item() {
+  local no="$1" text="$2"
+  printf ' %2s. %s\n' "$no" "$text"
+}
+
+print_success() {
+  color "1;32"; printf '✅ %s\n' "$*"; color_reset
+}
+
+print_warning() {
+  color "1;33"; printf '⚠️  %s\n' "$*" >&2; color_reset
+}
+
+print_error() {
+  color "1;31"; printf '❌ %s\n' "$*" >&2; color_reset
+}
+
+print_info() {
+  color "1;36"; printf 'ℹ️  %s\n' "$*"; color_reset
+}
+
+pause_return() {
+  [[ -t 0 ]] || return 0
+  printf '\n按 Enter 返回主菜单...'
+  read -r _
+}
+
+run_menu_action() {
+  "$@" || true
+  pause_return
+}
+
+run() {
+  if ((VERBOSE || DRY_RUN)); then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+  fi
+  if ((DRY_RUN)); then
+    return 0
+  fi
+  "$@"
+}
+
+confirm_prompt() {
+  local prompt="$1"
+  if ((ASSUME_YES)); then
+    return 0
+  fi
+  read -r -p "${prompt} [y/N] " reply
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+danger_ack() {
+  local phrase="$1"
+  local prompt="$2"
+  local input=""
+  echo "$prompt"
+  echo "请准确输入：${phrase}"
+  read -r input
+  [[ "$input" == "$phrase" ]]
+}
+
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "此命令必须使用 root 或 sudo 执行。"
+}
+
+init_layout() {
+  run mkdir -p \
+    "$BASE_DIR/modules" "$BASE_DIR/routes.d" "$BASE_DIR/certs" "$BASE_DIR/secrets" \
+    "$BASE_DIR/backups/ssh" "$BASE_DIR/backups/nginx" "$BASE_DIR/backups/firewall" \
+    "$BASE_DIR/backups/routes" "$BASE_DIR/backups/certs" "$BASE_DIR/backups/systemd" \
+    "$BASE_DIR/backups/fail2ban" "$BASE_DIR/state" "$LOG_DIR"
+  run chmod 700 "$BASE_DIR/secrets"
+  run chmod 700 "$BASE_DIR/backups"
+  run touch "$BASE_DIR/config.env" "$BASE_DIR/state/routes.json" "$BASE_DIR/state/modules.json" \
+    "$BASE_DIR/state/rollback.json" "$BASE_DIR/state/last-check.json"
+  run chmod 600 "$BASE_DIR/config.env" "$BASE_DIR/state/"*.json
+}
+
+write_file() {
+  local path="$1"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  if ((DRY_RUN)); then
+    info "预览模式：将写入 ${path}"
+    rm -f "$tmp"
+    return 0
+  fi
+  install -m 600 "$tmp" "$path"
+  rm -f "$tmp"
+}
+
+set_module_state() {
+  local module="$1" state="$2" note="${3:-}"
+  local file="$BASE_DIR/modules/${module}.env"
+  write_file "$file" <<EOF
+MODULE=${module}
+STATE=${state}
+UPDATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+NOTE=${note}
+EOF
+}
+
+snapshot_module() {
+  local module="$1"
+  local dest="$BASE_DIR/backups/${module}/$(date '+%Y%m%d-%H%M%S')"
+  run mkdir -p "$dest"
+  case "$module" in
+    ssh)
+      [[ -d /etc/ssh ]] && run tar -C /etc -czf "$dest/ssh.tar.gz" ssh
+      [[ -d /etc/systemd/system/ssh.socket.d ]] && run tar -C /etc/systemd/system -czf "$dest/ssh-socket.d.tar.gz" ssh.socket.d
+      [[ -d /etc/systemd/system/ssh.service.d ]] && run tar -C /etc/systemd/system -czf "$dest/ssh-service.d.tar.gz" ssh.service.d
+      ;;
+    nginx)
+      [[ -d /etc/nginx ]] && run tar -C /etc -czf "$dest/nginx.tar.gz" nginx
+      ;;
+    firewall)
+      have ufw && run sh -c "ufw status verbose > '$dest/ufw-status.txt' || true"
+      [[ -d /etc/ufw ]] && run tar -C /etc -czf "$dest/ufw.tar.gz" ufw
+      have iptables-save && run sh -c "iptables-save > '$dest/iptables.v4' || true"
+      have ip6tables-save && run sh -c "ip6tables-save > '$dest/iptables.v6' || true"
+      ;;
+    routes)
+      [[ -d "$BASE_DIR/routes.d" ]] && run tar -C "$BASE_DIR" -czf "$dest/routes.d.tar.gz" routes.d state/routes.json
+      [[ -d "$NGINX_STREAM_DIR" ]] && run tar -C /etc/nginx -czf "$dest/stream.d.tar.gz" stream.d
+      [[ -d "$NGINX_HTTP_DIR" ]] && run tar -C /etc/nginx -czf "$dest/conf.d.tar.gz" conf.d
+      ;;
+    certs)
+      [[ -d "$BASE_DIR/certs" ]] && run tar -C "$BASE_DIR" -czf "$dest/certs.tar.gz" certs
+      ;;
+    fail2ban)
+      [[ -d /etc/fail2ban ]] && run tar -C /etc -czf "$dest/fail2ban.tar.gz" fail2ban
+      ;;
+    *)
+      run tar -C "$BASE_DIR" -czf "$dest/vps-gateway-state.tar.gz" state modules routes.d config.env
+      ;;
+  esac
+  info "已创建快照：$dest"
+  printf '%s\n' "$dest"
+}
+
+latest_snapshot() {
+  local module="$1"
+  find "$BASE_DIR/backups/$module" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1
+}
+
+restore_module() {
+  local module="$1"
+  local snap="${2:-}"
+  [[ -n "$snap" ]] || snap="$(latest_snapshot "$module")"
+  [[ -n "$snap" && -d "$snap" ]] || die "未找到模块快照：$module"
+  info "正在从快照恢复 $module：$snap"
+  case "$module" in
+    ssh)
+      [[ -f "$snap/ssh.tar.gz" ]] && run tar -C /etc -xzf "$snap/ssh.tar.gz"
+      [[ -f "$snap/ssh-socket.d.tar.gz" ]] && run tar -C /etc/systemd/system -xzf "$snap/ssh-socket.d.tar.gz"
+      [[ -f "$snap/ssh-service.d.tar.gz" ]] && run tar -C /etc/systemd/system -xzf "$snap/ssh-service.d.tar.gz"
+      run systemctl daemon-reload
+      validate_sshd
+      reload_ssh
+      ;;
+    nginx)
+      [[ -f "$snap/nginx.tar.gz" ]] && run tar -C /etc -xzf "$snap/nginx.tar.gz"
+      validate_nginx
+      reload_nginx
+      ;;
+    firewall)
+      [[ -f "$snap/ufw.tar.gz" ]] && run tar -C /etc -xzf "$snap/ufw.tar.gz"
+      have ufw && run ufw reload || true
+      ;;
+    routes)
+      [[ -f "$snap/routes.d.tar.gz" ]] && run tar -C "$BASE_DIR" -xzf "$snap/routes.d.tar.gz"
+      [[ -f "$snap/stream.d.tar.gz" ]] && run tar -C /etc/nginx -xzf "$snap/stream.d.tar.gz"
+      [[ -f "$snap/conf.d.tar.gz" ]] && run tar -C /etc/nginx -xzf "$snap/conf.d.tar.gz"
+      validate_nginx
+      reload_nginx
+      ;;
+    certs)
+      [[ -f "$snap/certs.tar.gz" ]] && run tar -C "$BASE_DIR" -xzf "$snap/certs.tar.gz"
+      ;;
+    fail2ban)
+      [[ -f "$snap/fail2ban.tar.gz" ]] && run tar -C /etc -xzf "$snap/fail2ban.tar.gz"
+      have systemctl && run systemctl restart fail2ban || true
+      ;;
+    *)
+      die "未知回滚模块：$module"
+      ;;
+  esac
+}
+
+schedule_rollback() {
+  local tag="$1" module="$2" delay="${3:-5m}" snap="$4"
+  local script="$BASE_DIR/state/rollback-${tag}.sh"
+  write_file "$script" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec >>"$LOG_DIR/rollback.log" 2>&1
+echo "[\$(date '+%F %T')] Auto rollback tag=${tag} module=${module}"
+"$SELF_PATH" rollback --module "$module" --snapshot "$snap"
+EOF
+  run chmod 700 "$script"
+  if have systemd-run; then
+    run systemd-run --unit="vps-gateway-rollback-${tag}" --on-active="$delay" /bin/bash "$script"
+  else
+    warn "未找到 systemd-run，无法安排自动回滚。"
+  fi
+  write_file "$BASE_DIR/state/rollback.json" <<EOF
+{"tag":"$tag","module":"$module","snapshot":"$snap","delay":"$delay","created_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  warn "已为 ${module} 安排 ${delay} 后自动回滚。验证成功后请执行：vps-gateway confirm ${tag}"
+}
+
+cancel_rollback() {
+  local tag="${1:-}"
+  if [[ -z "$tag" || "$tag" == "all" ]]; then
+    if have systemctl; then
+      systemctl list-units 'vps-gateway-rollback-*' --all --no-legend 2>/dev/null | awk '{print $1}' | while read -r unit; do
+        [[ -n "$unit" ]] && run systemctl cancel "$unit" || true
+      done
+    fi
+    write_file "$BASE_DIR/state/rollback.json" <<'EOF'
+{}
+EOF
+    info "已取消回滚定时任务。"
+    return 0
+  fi
+  have systemctl && run systemctl cancel "vps-gateway-rollback-${tag}.timer" || true
+  write_file "$BASE_DIR/state/rollback.json" <<'EOF'
+{}
+EOF
+  info "已取消 ${tag} 的回滚定时任务。"
+}
+
+validate_sshd() {
+  local sshd_bin
+  sshd_bin="$(command -v sshd || command -v /usr/sbin/sshd || true)"
+  [[ -n "$sshd_bin" ]] || die "未找到 sshd。"
+  run "$sshd_bin" -t
+  if ((VERBOSE)); then
+    "$sshd_bin" -T | grep -Ei '^(port|listenaddress|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin|allowtcpforwarding|x11forwarding|allowagentforwarding|permittunnel) ' || true
+  fi
+}
+
+reload_ssh() {
+  validate_sshd
+  if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+    run systemctl reload ssh.service || run systemctl restart ssh.service
+  elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+    run systemctl reload sshd.service || run systemctl restart sshd.service
+  else
+    die "未找到 ssh.service 或 sshd.service。"
+  fi
+}
+
+validate_nginx() {
+  have nginx || die "未找到 nginx。"
+  run nginx -t
+}
+
+reload_nginx() {
+  validate_nginx
+  run systemctl reload nginx
+}
+
+cmd_init() {
+  require_root
+  init_layout
+  set_module_state core configured "layout initialized"
+  info "已初始化配置目录 ${BASE_DIR} 和日志目录 ${LOG_DIR}。"
+}
+
+public_ip() {
+  if have curl; then
+    curl -fsS --connect-timeout 2 https://api.ipify.org 2>/dev/null || true
+  fi
+}
+
+check_ports() {
+  if have ss; then
+    ss -lntup 2>/dev/null || ss -lntu 2>/dev/null || true
+  elif have netstat; then
+    netstat -lntup 2>/dev/null || true
+  fi
+}
+
+nginx_has_stream() {
+  nginx -V 2>&1 | grep -Eq -- '--with-stream|ngx_stream_module|stream=dynamic'
+}
+
+nginx_has_ssl_preread() {
+  nginx -V 2>&1 | grep -Eq -- '--with-stream_ssl_preread_module|ngx_stream_ssl_preread_module'
+}
+
+detect_cloud_ssh_dropins() {
+  find /etc/ssh/sshd_config.d -maxdepth 1 -type f -name '*.conf' 2>/dev/null | while read -r f; do
+    if [[ "$f" != "$SSH_DROPIN" ]] && grep -Eiq 'PasswordAuthentication|KbdInteractiveAuthentication|PermitRootLogin|Port|ListenAddress' "$f"; then
+      echo "$f"
+    fi
+  done
+}
+
+docker_public_ports() {
+  have docker || return 0
+  docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}' 2>/dev/null | grep -E '0\.0\.0\.0:|:::' || true
+}
+
+cmd_doctor() {
+  init_layout
+  local score=100
+  echo "VPS Gateway 系统自检 - $(date)"
+  echo "版本：$VERSION"
+  echo
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    echo "系统：${PRETTY_NAME:-unknown}"
+    [[ "${VERSION_ID:-}" == 24.04* && "${ID:-}" == "ubuntu" ]] || { echo "警告：期望系统为 Ubuntu 24.04.x"; score=$((score-8)); }
+  else
+    echo "警告：未找到 /etc/os-release"; score=$((score-8))
+  fi
+  echo "当前用户：$(id -un 2>/dev/null || true)，UID=${EUID:-$(id -u)}"
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "警告：当前不是 root，部分检查可能不完整"; score=$((score-3)); }
+  echo "SSH_CONNECTION：${SSH_CONNECTION:-当前不是 SSH 会话}"
+  echo "SSH_CLIENT：${SSH_CLIENT:-未知}"
+  echo "IPv6 地址："
+  ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print "  "$2}' || true
+  echo "公网 IPv4：$(public_ip)"
+  echo
+  echo "当前监听端口："
+  check_ports
+  echo
+  if have nginx; then
+    echo "Nginx：已安装 ($(nginx -v 2>&1))"
+    nginx_has_stream && echo "Nginx stream：支持" || { echo "Nginx stream：不支持或未知"; score=$((score-10)); }
+    nginx_has_ssl_preread && echo "Nginx ssl_preread：支持" || { echo "Nginx ssl_preread：不支持或未知"; score=$((score-10)); }
+  else
+    echo "Nginx：未安装"; score=$((score-8))
+  fi
+  echo
+  echo "SSH 最终生效配置："
+  if have sshd || [[ -x /usr/sbin/sshd ]]; then
+    /usr/sbin/sshd -T 2>/dev/null | grep -Ei '^(port|listenaddress|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin)' || true
+  else
+    echo "未找到 sshd"; score=$((score-10))
+  fi
+  local cloud_dropins
+  cloud_dropins="$(detect_cloud_ssh_dropins || true)"
+  if [[ -n "$cloud_dropins" ]]; then
+    echo "警告：以下 SSH drop-in 可能覆盖安全配置："
+    echo "$cloud_dropins" | sed 's/^/  /'
+    score=$((score-6))
+  fi
+  echo
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    echo "警告：ssh.socket 处于启用状态，端口/监听行为可能由 socket activation 驱动。"
+    score=$((score-4))
+  else
+    echo "ssh.socket：未启用或不存在"
+  fi
+  echo
+  if have ufw; then
+    echo "UFW："
+    ufw status verbose || true
+  else
+    echo "UFW：未安装"; score=$((score-4))
+  fi
+  have nft && { echo "nftables："; nft list ruleset 2>/dev/null | head -n 80 || true; }
+  have iptables && { echo "iptables INPUT 摘要："; iptables -S INPUT 2>/dev/null || true; }
+  echo
+  if have docker; then
+    echo "Docker：已安装"
+    local exposed
+    exposed="$(docker_public_ports || true)"
+    if [[ -n "$exposed" ]]; then
+      echo "警告：检测到 Docker 公网端口映射："
+      echo "$exposed" | sed 's/^/  /'
+      score=$((score-12))
+    else
+      echo "Docker 公网映射：未检测到"
+    fi
+  else
+    echo "Docker：未安装"
+  fi
+  echo
+  echo "Vaultwarden 检测："
+  detect_vaultwarden || true
+  echo "S-UI 检测："
+  detect_sui || true
+  echo
+  [[ "$score" -lt 0 ]] && score=0
+  echo "安全评分：${score}/100"
+  write_file "$BASE_DIR/state/last-check.json" <<EOF
+{"checked_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","score":$score}
+EOF
+}
+
+cmd_report() { cmd_doctor; }
+
+cmd_install_deps() {
+  require_root
+  init_layout
+  local mode="minimal"
+  while (($#)); do
+    case "$1" in
+      --minimal) mode="minimal"; shift ;;
+      --full) mode="full"; shift ;;
+      *) die "未知 install-deps 参数：$1" ;;
+    esac
+  done
+  local pkgs=(ca-certificates curl gnupg lsb-release openssh-server nginx-full ufw)
+  if [[ "$mode" == "full" ]]; then
+    pkgs+=(fail2ban jq socat cron tar gzip dnsutils net-tools)
+  fi
+  run apt-get update
+  run apt-get install -y "${pkgs[@]}"
+  set_module_state deps configured "$mode"
+  warn "依赖已安装。本命令没有修改 SSH、防火墙、Nginx 路由或服务配置。"
+  cmd_doctor
+}
+
+cmd_user_create() {
+  require_root
+  init_layout
+  local name=""
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      *) die "未知 user-create 参数：$1" ;;
+    esac
+  done
+  [[ "$name" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "用户名格式无效。"
+  if id "$name" >/dev/null 2>&1; then
+    info "用户已存在：$name"
+  else
+    run useradd -m -G sudo -s /bin/bash "$name"
+    warn "请为 ${name} 设置强本地控制台密码：passwd ${name}"
+  fi
+}
+
+ensure_user_ssh_dir() {
+  local user="$1"
+  local home
+  home="$(getent passwd "$user" | cut -d: -f6)"
+  [[ -n "$home" && -d "$home" ]] || die "未找到用户 $user 的家目录"
+  run mkdir -p "$home/.ssh"
+  run chmod 700 "$home/.ssh"
+  run touch "$home/.ssh/authorized_keys"
+  run chmod 600 "$home/.ssh/authorized_keys"
+  run chown -R "$user:$user" "$home/.ssh"
+  printf '%s/.ssh/authorized_keys\n' "$home"
+}
+
+append_key_unique() {
+  local auth="$1" key="$2"
+  grep -qxF "$key" "$auth" 2>/dev/null || run sh -c "printf '%s\n' '$key' >> '$auth'"
+}
+
+cmd_ssh_import_key() {
+  require_root
+  init_layout
+  local user="" github="" file="" key=""
+  while (($#)); do
+    case "$1" in
+      --user) user="$2"; shift 2 ;;
+      --github) github="$2"; shift 2 ;;
+      --file) file="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      *) die "未知 ssh-import-key 参数：$1" ;;
+    esac
+  done
+  [[ -n "$user" ]] || die "必须提供 --user"
+  id "$user" >/dev/null 2>&1 || die "用户不存在：$user"
+  local auth
+  auth="$(ensure_user_ssh_dir "$user")"
+  if [[ -n "$github" ]]; then
+    have curl || die "需要先安装 curl"
+    local keys
+    keys="$(curl -fsSL "https://github.com/${github}.keys")"
+    [[ -n "$keys" ]] || die "未找到 GitHub 公钥。"
+    while IFS= read -r line; do
+      [[ "$line" =~ ^ssh- ]] && append_key_unique "$auth" "$line"
+    done <<<"$keys"
+  elif [[ -n "$file" ]]; then
+    [[ -f "$file" ]] || die "未找到公钥文件：$file"
+    while IFS= read -r line; do
+      [[ "$line" =~ ^ssh- ]] && append_key_unique "$auth" "$line"
+    done <"$file"
+  elif [[ -n "$key" ]]; then
+    [[ "$key" =~ ^ssh- ]] || die "SSH 公钥格式无效。"
+    append_key_unique "$auth" "$key"
+  else
+    die "请使用 --github、--file 或 --key 指定公钥来源。"
+  fi
+  run chown "$user:$user" "$auth"
+  info "已为 $user 导入 SSH 公钥。"
+}
+
+authorized_key_count() {
+  find /root /home -maxdepth 3 -path '*/.ssh/authorized_keys' -type f 2>/dev/null \
+    -exec awk 'NF && $1 ~ /^ssh-/{c++} END{print c+0}' {} + | awk '{s+=$1} END{print s+0}'
+}
+
+write_ssh_dropin() {
+  local port="${1:-}" internal="${2:-0}"
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "# Managed by vps-gateway. Do not edit by hand."
+    [[ -n "$port" ]] && echo "Port $port"
+    if [[ "$internal" == "1" ]]; then
+      echo "ListenAddress 127.0.0.1"
+      echo "ListenAddress ::1"
+    fi
+    cat <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTunnel no
+EOF
+  } >"$tmp"
+  if ((DRY_RUN)); then
+    info "预览模式：将写入 $SSH_DROPIN"
+    cat "$tmp"
+    rm -f "$tmp"
+  else
+    install -m 600 "$tmp" "$SSH_DROPIN"
+    rm -f "$tmp"
+  fi
+}
+
+cmd_ssh_harden() {
+  require_root
+  init_layout
+  local count
+  count="$(authorized_key_count)"
+  [[ "$count" -gt 0 ]] || die "未找到可用 SSH 公钥。禁用密码登录前请先导入公钥。"
+  local dropins
+  dropins="$(detect_cloud_ssh_dropins || true)"
+  [[ -z "$dropins" ]] || warn "其他 SSH drop-in 可能覆盖当前设置：$dropins"
+  local snap
+  snap="$(snapshot_module ssh)"
+  write_ssh_dropin "" 0
+  validate_sshd
+  schedule_rollback "ssh" "ssh" "5m" "$snap"
+  reload_ssh
+  set_module_state ssh configured "hardened"
+  /usr/sbin/sshd -T | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin|permitemptypasswords|x11forwarding|allowagentforwarding|permittunnel) ' || true
+}
+
+cmd_ssh_internalize() {
+  require_root
+  init_layout
+  local port=""
+  while (($#)); do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *) die "未知 ssh-internalize 参数：$1" ;;
+    esac
+  done
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || die "--port 必须是 1..65535 之间的数字"
+  [[ "$(authorized_key_count)" -gt 0 ]] || die "未找到可用 SSH 公钥。"
+  warn "此操作会让 OpenSSH 监听 127.0.0.1:${port}，请保持当前 SSH 会话不要关闭。"
+  warn "在验证 SSH over 443 前，不要通过防火墙关闭公网 22。"
+  if [[ -n "${SSH_CONNECTION:-}" ]] && ! danger_ack "我已确认有控制台或回滚救援方式" "这是高危 SSH 修改。脚本会安排 systemd 自动回滚，但你仍应具备 VNC/IPMI/救援模式访问能力。"; then
+    die "已取消。"
+  fi
+  local snap
+  snap="$(snapshot_module ssh)"
+  write_ssh_dropin "$port" 1
+  validate_sshd
+  schedule_rollback "ssh" "ssh" "5m" "$snap"
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    warn "ssh.socket 当前处于启用状态。将禁用 socket activation，以便 sshd_config 的 ListenAddress/Port 生效。"
+    run systemctl disable --now ssh.socket
+  fi
+  run systemctl enable --now ssh.service
+  reload_ssh
+  set_module_state ssh configured "internalized:${port}"
+  /usr/sbin/sshd -T | grep -Ei '^(port|listenaddress|passwordauthentication|pubkeyauthentication)' || true
+}
+
+cmd_ssh_check() {
+  init_layout
+  local mark=0
+  while (($#)); do
+    case "$1" in
+      --mark-443-verified) mark=1; shift ;;
+      *) die "未知 ssh-check 参数：$1" ;;
+    esac
+  done
+  validate_sshd
+  /usr/sbin/sshd -T | grep -Ei '^(port|listenaddress|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin|allowtcpforwarding|x11forwarding|allowagentforwarding|permittunnel) ' || true
+  check_ports | grep -E ':(22|2222|443)\b' || true
+  if ((mark)); then
+    write_file "$BASE_DIR/state/ssh443-verified.env" <<EOF
+SSH_OVER_443_VERIFIED=yes
+VERIFIED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+EOF
+    info "已标记 SSH over 443 通过人工验证。"
+  fi
+}
+
+cmd_gateway_install() {
+  require_root
+  init_layout
+  have nginx || run apt-get install -y nginx-full
+  nginx_has_stream || die "未检测到 Nginx stream 模块。请安装 nginx-full 或对应动态模块。"
+  nginx_has_ssl_preread || die "未检测到 Nginx ssl_preread 模块。"
+  if [[ -f "$REALITY_CONF_DEFAULT" ]] && grep -Eq 'listen[[:space:]].*443' "$REALITY_CONF_DEFAULT"; then
+    die "检测到现有 Reality stream 配置已监听 443：$REALITY_CONF_DEFAULT。请使用 reality-route-* 命令管理路由，不要执行 gateway-install 抢占 443。"
+  fi
+  local snap
+  snap="$(snapshot_module nginx)"
+  run mkdir -p "$NGINX_STREAM_DIR"
+  ensure_nginx_stream_include
+  write_file "$NGINX_STREAM_DIR/00-global-map.conf" <<'EOF'
+# Managed by vps-gateway.
+map $ssl_preread_protocol $vgw_is_tls {
+    ""      0;
+    default 1;
+}
+
+map $ssl_preread_server_name $vgw_tls_backend {
+    include /etc/nginx/stream.d/20-sni-routes.conf;
+    default 127.0.0.1:8443;
+}
+
+map $vgw_is_tls $vgw_final_backend {
+    0       127.0.0.1:2222;
+    1       $vgw_tls_backend;
+}
+EOF
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
+# Managed by vps-gateway. Route lines look like:
+# example.com 127.0.0.1:8444;
+EOF
+  write_file "$NGINX_STREAM_DIR/10-ssh-backend.conf" <<'EOF'
+# Managed by vps-gateway. SSH backend is 127.0.0.1:2222.
+EOF
+  write_file "$NGINX_STREAM_DIR/90-gateway.conf" <<'EOF'
+# Managed by vps-gateway. Public TCP 443 gateway.
+server {
+    listen 0.0.0.0:443 reuseport;
+    listen [::]:443 reuseport;
+    ssl_preread on;
+    proxy_connect_timeout 10s;
+    proxy_timeout 12h;
+    proxy_pass $vgw_final_backend;
+}
+EOF
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  set_module_state nginx configured "stream gateway installed"
+}
+
+ensure_nginx_stream_include() {
+  local conf="$NGINX_DIR/nginx.conf"
+  [[ -f "$conf" ]] || die "未找到 $conf"
+  grep -q 'include /etc/nginx/stream.d/\*.conf;' "$conf" && return 0
+  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$conf"; then
+    warn "检测到已有 stream 块，但没有 vps-gateway include。请手动加入：include /etc/nginx/stream.d/*.conf;"
+    die "为避免误改现有 Nginx stream 配置，已停止自动修改。"
+  fi
+  local snap
+  snap="$(snapshot_module nginx)"
+  if ((DRY_RUN)); then
+    info "预览模式：将在 $conf 末尾追加 stream include 块"
+  else
+    cp -a "$conf" "$conf.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    cat >>"$conf" <<'EOF'
+
+# Managed by vps-gateway.
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+EOF
+  fi
+  info "nginx.conf 已纳入 Nginx 快照：$snap"
+}
+
+cmd_gateway_enable() { require_root; cmd_gateway_install; }
+
+cmd_gateway_disable() {
+  require_root
+  init_layout
+  local snap
+  snap="$(snapshot_module nginx)"
+  [[ -f "$NGINX_STREAM_DIR/90-gateway.conf" ]] && run mv "$NGINX_STREAM_DIR/90-gateway.conf" "$NGINX_STREAM_DIR/90-gateway.conf.disabled"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  set_module_state nginx disabled "gateway disabled"
+}
+
+cmd_gateway_check() {
+  init_layout
+  have nginx || die "未找到 nginx"
+  nginx -V 2>&1 | tr ' ' '\n' | grep -E -- 'stream|ssl_preread' || true
+  validate_nginx
+  echo "Stream 路由："
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] && cat "$NGINX_STREAM_DIR/20-sni-routes.conf" || true
+  check_ports | grep ':443' || true
+}
+
+reality_parse_file_arg() {
+  local file="$REALITY_CONF_DEFAULT"
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf '%s\n' "$file"
+}
+
+reality_backend_is_safe() {
+  local backend="$1"
+  [[ "$backend" =~ ^(127\.0\.0\.1|\[?::1\]?|localhost):[0-9]+$ ]] || return 1
+  [[ "$backend" != 0.0.0.0:* && "$backend" != "[::]:"* ]]
+}
+
+reality_require_conf() {
+  local file="$1"
+  [[ -f "$file" ]] || die "未找到 Reality stream 配置：$file"
+  grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$file" \
+    || die "配置文件不像预期的 backend_reality map：$file"
+}
+
+cmd_reality_check() {
+  init_layout
+  local file
+  file="$(reality_parse_file_arg "$@")"
+  reality_require_conf "$file"
+  echo "Reality 配置文件：$file"
+  echo
+  echo "当前 Reality SNI 路由："
+  awk '
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; next}
+    inside && /^[[:space:]]*\}/ {inside=0}
+    inside && $1 !~ /^#/ && NF >= 2 {print}
+  ' "$file"
+  echo
+  if grep -q '\$ssl_preread_protocol' "$file"; then
+    echo "协议分流：已存在"
+  else
+    warn "未检测到 ssl_preread_protocol 分流。普通 SSH 没有 TLS SNI，会落入 map 的 default 后端。"
+  fi
+  validate_nginx
+}
+
+cmd_reality_route_list() {
+  local file
+  file="$(reality_parse_file_arg "$@")"
+  reality_require_conf "$file"
+  awk '
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; next}
+    inside && /^[[:space:]]*\}/ {inside=0}
+    inside && $1 !~ /^#/ && NF >= 2 {gsub(/;/, "", $2); printf "%-36s %s\n", $1, $2}
+  ' "$file"
+}
+
+reality_rewrite_route() {
+  local file="$1" sni="$2" backend="$3" mode="$4"
+  local tmp
+  tmp="$(mktemp)"
+  set +e
+  awk -v sni="$sni" -v backend="$backend" -v mode="$mode" '
+    BEGIN {inside=0; changed=0; inserted=0}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; print; next}
+    inside && /^[[:space:]]*\}/ {
+      if (mode == "add" && !inserted) {
+        printf "    %-34s %s;\n", sni, backend
+        inserted=1; changed=1
+      }
+      inside=0; print; next
+    }
+    inside && $1 == sni {
+      if (mode == "remove") {changed=1; next}
+      printf "    %-34s %s;\n", sni, backend
+      changed=1; inserted=1
+      next
+    }
+    inside && mode == "add" && $1 == "default" && !inserted {
+      printf "    %-34s %s;\n", sni, backend
+      inserted=1; changed=1
+      print; next
+    }
+    {print}
+    END {
+      if (mode == "remove" && changed == 0) exit 3
+      if (mode == "add" && changed == 0) exit 4
+    }
+  ' "$file" >"$tmp"
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 3 ]]; then
+    rm -f "$tmp"
+    die "未找到 Reality 路由：$sni"
+  elif [[ "$rc" -ne 0 ]]; then
+    rm -f "$tmp"
+    die "重写 Reality 路由表失败。"
+  fi
+  if ((DRY_RUN)); then
+    info "预览模式：将更新 $file"
+    cat "$tmp"
+    rm -f "$tmp"
+  else
+    cp -a "$file" "$file.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    install -m 644 "$tmp" "$file"
+    rm -f "$tmp"
+  fi
+}
+
+reality_set_default_backend() {
+  local file="$1" backend="$2"
+  local tmp
+  tmp="$(mktemp)"
+  set +e
+  awk -v backend="$backend" '
+    BEGIN {inside=0; changed=0}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; print; next}
+    inside && /^[[:space:]]*\}/ {inside=0; print; next}
+    inside && $1 == "default" {
+      printf "    %-34s %s;\n", "default", backend
+      changed=1
+      next
+    }
+    {print}
+    END { if (changed == 0) exit 3 }
+  ' "$file" >"$tmp"
+  local rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f "$tmp"
+    die "更新 Reality 默认后端失败。"
+  fi
+  if ((DRY_RUN)); then
+    info "预览模式：将更新 $file"
+    cat "$tmp"
+    rm -f "$tmp"
+  else
+    cp -a "$file" "$file.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    install -m 644 "$tmp" "$file"
+    rm -f "$tmp"
+  fi
+}
+
+cmd_reality_route_add() {
+  require_root
+  init_layout
+  local file="$REALITY_CONF_DEFAULT" sni="" backend=""
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      --sni) sni="$2"; shift 2 ;;
+      --backend) backend="$2"; shift 2 ;;
+      *) die "未知 reality-route-add 参数：$1" ;;
+    esac
+  done
+  valid_sni "$sni" || die "--sni 格式无效"
+  reality_backend_is_safe "$backend" || die "Reality 后端必须是本机回环地址，例如 127.0.0.1:6443。"
+  reality_require_conf "$file"
+  local snap
+  snap="$(snapshot_module nginx)"
+  reality_rewrite_route "$file" "$sni" "$backend" "add"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  info "Reality 路由已设置：$sni -> $backend"
+}
+
+cmd_reality_route_remove() {
+  require_root
+  init_layout
+  local file="$REALITY_CONF_DEFAULT" sni=""
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      --sni) sni="$2"; shift 2 ;;
+      *) die "未知 reality-route-remove 参数：$1" ;;
+    esac
+  done
+  valid_sni "$sni" || die "--sni 格式无效"
+  reality_require_conf "$file"
+  confirm_prompt "确认从 ${file} 删除 Reality SNI 路由 ${sni} 吗？" || die "已取消。"
+  local snap
+  snap="$(snapshot_module nginx)"
+  reality_rewrite_route "$file" "$sni" "" "remove"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  info "Reality 路由已删除：$sni"
+}
+
+cmd_reality_route_set_default() {
+  require_root
+  init_layout
+  local file="$REALITY_CONF_DEFAULT" backend=""
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      --backend) backend="$2"; shift 2 ;;
+      *) die "未知 reality-route-set-default 参数：$1" ;;
+    esac
+  done
+  reality_backend_is_safe "$backend" || die "默认后端必须是本机回环地址。"
+  reality_require_conf "$file"
+  local snap
+  snap="$(snapshot_module nginx)"
+  reality_set_default_backend "$file" "$backend"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  info "Reality 默认后端已设置为 $backend"
+}
+
+show_reality_menu() {
+  local file="$REALITY_CONF_DEFAULT"
+  while true; do
+    print_banner "Reality SNI 路由管理"
+    printf '当前配置：%s\n\n' "$file"
+    print_menu_item 1 "检查 Reality stream 配置"
+    print_menu_item 2 "查看 Reality SNI 路由"
+    print_menu_item 3 "添加 / 更新 Reality SNI 路由"
+    print_menu_item 4 "删除 Reality SNI 路由"
+    print_menu_item 5 "修改默认 Reality 后端"
+    print_menu_item 6 "切换配置文件"
+    print_menu_item 7 "返回主菜单"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-7]: " c; then
+      echo "已退出 Reality SNI 路由管理。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_reality_check --file "$file" ;;
+      2) run_menu_action cmd_reality_route_list --file "$file" ;;
+      3)
+        local sni="" backend=""
+        read -r -p "请输入 SNI 域名: " sni
+        read -r -p "请输入后端地址，例如 127.0.0.1:6443: " backend
+        run_menu_action cmd_reality_route_add --file "$file" --sni "$sni" --backend "$backend"
+        ;;
+      4)
+        local sni=""
+        read -r -p "请输入要删除的 SNI 域名: " sni
+        run_menu_action cmd_reality_route_remove --file "$file" --sni "$sni"
+        ;;
+      5)
+        local backend=""
+        read -r -p "请输入默认后端，例如 127.0.0.1:2443: " backend
+        run_menu_action cmd_reality_route_set_default --file "$file" --backend "$backend"
+        ;;
+      6)
+        read -r -p "请输入 Reality 配置文件路径: " file
+        [[ -n "$file" ]] || file="$REALITY_CONF_DEFAULT"
+        ;;
+      7) return 0 ;;
+      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_reality_menu() { show_reality_menu "$@"; }
+
+valid_sni() { [[ "$1" =~ ^(\*\.)?[A-Za-z0-9.-]+$ && "$1" == *.* ]]; }
+valid_port() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]; }
+backend_is_safe() {
+  local backend="$1"
+  [[ "$backend" =~ ^(127\.0\.0\.1|\[?::1\]?|localhost|[A-Za-z0-9_.-]+):[0-9]+$ ]] || return 1
+  [[ "$backend" != 0.0.0.0:* && "$backend" != "[::]:"* ]]
+}
+
+route_json_path() { printf '%s/routes.d/%s.json' "$BASE_DIR" "$1"; }
+inner_conf_path() { printf '%s/%s.inner.conf' "$NGINX_HTTP_DIR" "$1"; }
+
+route_line_exists() {
+  local sni="$1"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] && grep -Eq "^[[:space:]]*${sni//./\\.}[[:space:]]+" "$NGINX_STREAM_DIR/20-sni-routes.conf"
+}
+
+inner_port_conflict() {
+  local port="$1" sni="${2:-}"
+  grep -R "listen 127.0.0.1:${port} ssl" "$NGINX_HTTP_DIR" "$BASE_DIR/routes.d" 2>/dev/null | grep -v "$sni" || true
+}
+
+rebuild_routes_index() {
+  local out="$BASE_DIR/state/routes.json"
+  if have jq; then
+    jq -s '.' "$BASE_DIR"/routes.d/*.json >"$out" 2>/dev/null || echo '[]' >"$out"
+  else
+    {
+      echo "["
+      local first=1 f
+      for f in "$BASE_DIR"/routes.d/*.json; do
+        [[ -f "$f" ]] || continue
+        ((first)) || echo ","
+        first=0
+        cat "$f"
+      done
+      echo "]"
+    } >"$out"
+  fi
+  chmod 600 "$out" 2>/dev/null || true
+}
+
+write_route_state() {
+  local sni="$1" inner_port="$2" backend="$3" type="$4" cert="$5" key="$6" enabled="$7" status="$8"
+  write_file "$(route_json_path "$sni")" <<EOF
+{"sni":"$sni","inner_port":$inner_port,"backend":"$backend","type":"$type","cert":"$cert","key":"$key","enabled":$enabled,"status":"$status","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  rebuild_routes_index
+}
+
+generate_inner_nginx_conf() {
+  local sni="$1" inner_port="$2" backend="$3" type="$4" cert="$5" key="$6"
+  local access_log="off"
+  [[ "$type" != "vaultwarden" ]] && access_log="/var/log/nginx/${sni}.access.log"
+  write_file "$(inner_conf_path "$sni")" <<EOF
+# Managed by vps-gateway.
+server {
+    listen 127.0.0.1:${inner_port} ssl;
+    listen [::1]:${inner_port} ssl;
+    http2 on;
+    server_name ${sni};
+
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log ${access_log};
+    error_log /var/log/nginx/${sni}.error.log warn;
+
+    location / {
+        proxy_pass http://${backend};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+    }
+}
+EOF
+}
+
+add_stream_route_line() {
+  local sni="$1" inner_port="$2"
+  run mkdir -p "$NGINX_STREAM_DIR"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
+# Managed by vps-gateway.
+EOF
+  if route_line_exists "$sni"; then
+    run sed -i.bak -E "s|^[[:space:]]*${sni//./\\.}[[:space:]].*|    ${sni} 127.0.0.1:${inner_port};|" "$NGINX_STREAM_DIR/20-sni-routes.conf"
+  else
+    run sh -c "printf '    %s 127.0.0.1:%s;\n' '$sni' '$inner_port' >> '$NGINX_STREAM_DIR/20-sni-routes.conf'"
+  fi
+}
+
+remove_stream_route_line() {
+  local sni="$1"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || return 0
+  run sed -i.bak -E "/^[[:space:]]*${sni//./\\.}[[:space:]]+/d" "$NGINX_STREAM_DIR/20-sni-routes.conf"
+}
+
+cmd_route_add() {
+  require_root
+  init_layout
+  local sni="" inner_port="" backend="" type="generic" cert_domain="" cert="" key=""
+  while (($#)); do
+    case "$1" in
+      --sni) sni="$2"; shift 2 ;;
+      --inner-port) inner_port="$2"; shift 2 ;;
+      --backend) backend="$2"; shift 2 ;;
+      --type) type="$2"; shift 2 ;;
+      --cert-domain) cert_domain="$2"; shift 2 ;;
+      --cert) cert="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      *) die "未知 route-add 参数：$1" ;;
+    esac
+  done
+  valid_sni "$sni" || die "--sni 格式无效"
+  valid_port "$inner_port" || die "--inner-port 格式无效"
+  backend_is_safe "$backend" || die "后端必须是回环/内部地址，不能配置为 0.0.0.0。"
+  [[ -z "$(inner_port_conflict "$inner_port" "$sni")" ]] || die "内层端口冲突：$inner_port"
+  if [[ -z "$cert" && -z "$key" ]]; then
+    local d="${cert_domain:-$sni}"
+    cert="$BASE_DIR/certs/$d/fullchain.pem"
+    key="$BASE_DIR/certs/$d/privkey.pem"
+  fi
+  if [[ "$type" == "tcp-pass-through" ]]; then
+    cert=""
+    key=""
+  elif [[ ! -f "$cert" || ! -f "$key" ]]; then
+    warn "证书文件缺失。将只创建 pending_cert 状态，不启用该路由。"
+    write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "false" "pending_cert"
+    return 0
+  fi
+  local snap
+  snap="$(snapshot_module routes)"
+  if [[ "$type" == "tcp-pass-through" ]]; then
+    add_stream_route_line "$sni" "${backend##*:}"
+  else
+    generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
+    add_stream_route_line "$sni" "$inner_port"
+  fi
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+  write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "true" "enabled"
+  info "路由已启用：${sni} -> 127.0.0.1:${inner_port} -> ${backend}"
+}
+
+cmd_route_remove() {
+  require_root
+  init_layout
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "未知 route-remove 参数：$1" ;; esac; done
+  valid_sni "$sni" || die "--sni 格式无效"
+  confirm_prompt "确认删除路由 ${sni} 吗？" || die "已取消。"
+  local snap
+  snap="$(snapshot_module routes)"
+  remove_stream_route_line "$sni"
+  [[ -f "$(inner_conf_path "$sni")" ]] && run rm -f "$(inner_conf_path "$sni")"
+  [[ -f "$(route_json_path "$sni")" ]] && run rm -f "$(route_json_path "$sni")"
+  rebuild_routes_index
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+}
+
+cmd_route_list() {
+  init_layout
+  rebuild_routes_index
+  cat "$BASE_DIR/state/routes.json"
+}
+
+cmd_route_disable() {
+  require_root
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "未知 route-disable 参数：$1" ;; esac; done
+  valid_sni "$sni" || die "--sni 格式无效"
+  local snap
+  snap="$(snapshot_module routes)"
+  remove_stream_route_line "$sni"
+  [[ -f "$(inner_conf_path "$sni")" ]] && run mv "$(inner_conf_path "$sni")" "$(inner_conf_path "$sni").disabled"
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+  info "路由已禁用：$sni"
+}
+
+cmd_route_enable() {
+  require_root
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "未知 route-enable 参数：$1" ;; esac; done
+  valid_sni "$sni" || die "--sni 格式无效"
+  local json
+  json="$(route_json_path "$sni")"
+  [[ -f "$json" ]] || die "未找到路由状态：$sni"
+  local inner_port backend type cert key
+  if have jq; then
+    inner_port="$(jq -r .inner_port "$json")"; backend="$(jq -r .backend "$json")"; type="$(jq -r .type "$json")"; cert="$(jq -r .cert "$json")"; key="$(jq -r .key "$json")"
+  else
+    inner_port="$(grep -o '"inner_port":[0-9]*' "$json" | cut -d: -f2)"
+    backend="$(grep -o '"backend":"[^"]*' "$json" | cut -d\" -f4)"
+    type="$(grep -o '"type":"[^"]*' "$json" | cut -d\" -f4)"
+    cert="$(grep -o '"cert":"[^"]*' "$json" | cut -d\" -f4)"
+    key="$(grep -o '"key":"[^"]*' "$json" | cut -d\" -f4)"
+  fi
+  [[ "$type" == "tcp-pass-through" || ( -f "$cert" && -f "$key" ) ]] || die "$sni 缺少证书文件"
+  local snap
+  snap="$(snapshot_module routes)"
+  [[ "$type" == "tcp-pass-through" ]] || generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
+  add_stream_route_line "$sni" "$inner_port"
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+  write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "true" "enabled"
+}
+
+cmd_route_check() {
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "未知 route-check 参数：$1" ;; esac; done
+  valid_sni "$sni" || die "--sni 格式无效"
+  [[ -f "$(route_json_path "$sni")" ]] && cat "$(route_json_path "$sni")" || warn "未找到 $sni 的状态文件"
+  grep -R "$sni" "$NGINX_STREAM_DIR" "$NGINX_HTTP_DIR" 2>/dev/null || true
+  validate_nginx
+}
+
+detect_vaultwarden() {
+  if have docker; then
+    docker ps --format '{{.Names}} {{.Image}} {{.Ports}}' 2>/dev/null | grep -Ei 'vaultwarden|bitwardenrs' || true
+  fi
+  systemctl list-units --type=service --all 2>/dev/null | grep -Ei 'vaultwarden|bitwarden' || true
+  check_ports | grep -E ':(8000|3012)\b' || true
+}
+
+cmd_vaultwarden_detect() { detect_vaultwarden; }
+cmd_vaultwarden_check() { detect_vaultwarden; docker_public_ports | grep -Ei 'vaultwarden|bitwarden' || true; }
+cmd_vaultwarden_secure() {
+  warn "Vaultwarden 是密码管理器。本命令只报告风险，不会修改容器或数据。"
+  cmd_vaultwarden_check
+  warn "建议暴露方式：后端绑定到 127.0.0.1:8000 或 Docker 内部网络，再通过 Nginx 443 接入。"
+}
+cmd_vaultwarden_route_add() { cmd_route_add --type vaultwarden "$@"; }
+cmd_vaultwarden_admin_protect() {
+  cat <<'EOF'
+Vaultwarden /admin 加固建议：
+  1. 非维护期间建议禁用 ADMIN_TOKEN。
+  2. 在内层 Nginx 中限制 /admin 来源 IP。
+  3. 为 /admin 添加 Basic Auth。
+  4. 只允许本机访问 admin，并通过 SSH 隧道进入。
+为避免影响维护访问，本命令不会自动修改配置。
+EOF
+}
+cmd_vaultwarden_backup() {
+  require_root
+  init_layout
+  local dest="$BASE_DIR/backups/vaultwarden/$(date '+%Y%m%d-%H%M%S')"
+  run mkdir -p "$dest"
+  warn "此通用备份不会删除数据。如果自动检测遗漏，请手动补充 Docker volume 或数据目录。"
+  have docker && docker inspect "$(docker ps -q --filter ancestor=vaultwarden/server 2>/dev/null)" >"$dest/docker-inspect.json" 2>/dev/null || true
+  info "已创建备份元数据：$dest"
+}
+
+detect_sui() {
+  systemctl list-units --type=service --all 2>/dev/null | grep -Ei '(^|[^a-z])s-ui|sui' || true
+  ps -ef | grep -Ei 's-ui|sui' | grep -v grep || true
+  check_ports | grep -Ei 's-ui|sui|:[0-9]+' | head -n 30 || true
+}
+
+cmd_sui_detect() { detect_sui; }
+cmd_sui_check() { detect_sui; }
+cmd_sui_secure() {
+  warn "本命令只报告 S-UI 暴露情况，不会自动重写 S-UI 配置。"
+  detect_sui
+  warn "如果 S-UI 监听 0.0.0.0，请先在 S-UI 自身配置或面板中改为 127.0.0.1，再添加 SNI 路由。"
+}
+cmd_sui_route_add() { cmd_route_add --type sui "$@"; }
+
+cmd_cert_install_acme() {
+  require_root
+  init_layout
+  have curl || run apt-get install -y curl socat cron
+  if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+    run sh -c 'curl -fsSL https://get.acme.sh | sh'
+  fi
+  set_module_state cert configured "acme.sh installed"
+}
+
+cmd_cert_set_cloudflare() {
+  require_root
+  init_layout
+  local token=""
+  read -rsp "请输入 Cloudflare DNS API Token（不要使用 Global API Key）: " token
+  echo
+  [[ -n "$token" ]] || die "Token 不能为空。"
+  write_file "$BASE_DIR/secrets/cloudflare.env" <<EOF
+CF_Token='$token'
+EOF
+  run chmod 600 "$BASE_DIR/secrets/cloudflare.env"
+  warn "请使用最小权限 Token：仅指定 Zone 的 DNS Edit 权限。"
+}
+
+cmd_cert_issue() {
+  require_root
+  init_layout
+  local domain="" email=""
+  while (($#)); do
+    case "$1" in
+      --domain) domain="$2"; shift 2 ;;
+      --email) email="$2"; shift 2 ;;
+      *) die "未知 cert-issue 参数：$1" ;;
+    esac
+  done
+  valid_sni "$domain" || die "域名格式无效"
+  [[ -n "$email" ]] || die "必须提供 --email"
+  [[ -f "$BASE_DIR/secrets/cloudflare.env" ]] || die "请先执行 cert-set-cloudflare。"
+  cmd_cert_install_acme
+  # shellcheck disable=SC1090
+  . "$BASE_DIR/secrets/cloudflare.env"
+  export CF_Token
+  local cert_dir="$BASE_DIR/certs/$domain"
+  run mkdir -p "$cert_dir"
+  local snap
+  snap="$(snapshot_module certs)"
+  run /root/.acme.sh/acme.sh --register-account -m "$email" || true
+  run /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength ec-256
+  run /root/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+    --fullchain-file "$cert_dir/fullchain.pem" \
+    --key-file "$cert_dir/privkey.pem" \
+    --reloadcmd "systemctl reload nginx"
+  run chmod 600 "$cert_dir/privkey.pem"
+  write_file "$cert_dir/meta.json" <<EOF
+{"domain":"$domain","source":"acme.sh","key_type":"ec-256","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  validate_nginx || true
+  schedule_rollback "certs" "certs" "10m" "$snap"
+  have systemctl && systemctl reload nginx 2>/dev/null || true
+}
+
+cmd_cert_import() {
+  require_root
+  init_layout
+  local domain="" cert="" key=""
+  while (($#)); do
+    case "$1" in
+      --domain) domain="$2"; shift 2 ;;
+      --cert) cert="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      *) die "未知 cert-import 参数：$1" ;;
+    esac
+  done
+  valid_sni "$domain" || die "域名格式无效"
+  [[ -f "$cert" && -f "$key" ]] || die "未找到证书或私钥文件。"
+  local dest="$BASE_DIR/certs/$domain"
+  local snap
+  snap="$(snapshot_module certs)"
+  run mkdir -p "$dest"
+  run install -m 600 "$cert" "$dest/fullchain.pem"
+  run install -m 600 "$key" "$dest/privkey.pem"
+  write_file "$dest/meta.json" <<EOF
+{"domain":"$domain","source":"import","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  schedule_rollback "certs" "certs" "10m" "$snap"
+}
+
+cmd_cert_list() { find "$BASE_DIR/certs" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; }
+cmd_cert_status() {
+  local d
+  for d in "$BASE_DIR"/certs/*; do
+    [[ -f "$d/fullchain.pem" ]] || continue
+    echo "== $(basename "$d") =="
+    openssl x509 -in "$d/fullchain.pem" -noout -subject -issuer -dates 2>/dev/null || true
+    stat -c 'privkey mode: %a %n' "$d/privkey.pem" 2>/dev/null || true
+  done
+}
+cmd_cert_renew() {
+  require_root
+  [[ -x /root/.acme.sh/acme.sh ]] || die "尚未安装 acme.sh"
+  run /root/.acme.sh/acme.sh --cron --home /root/.acme.sh
+  have systemctl && run systemctl reload nginx || true
+}
+cmd_cert_remove() {
+  require_root
+  local domain=""
+  while (($#)); do case "$1" in --domain) domain="$2"; shift 2 ;; *) die "未知 cert-remove 参数：$1" ;; esac; done
+  valid_sni "$domain" || die "域名格式无效"
+  grep -R "\"cert\":\"$BASE_DIR/certs/$domain/" "$BASE_DIR/routes.d" >/dev/null 2>&1 && die "证书仍被路由引用，不能删除。"
+  confirm_prompt "确认删除 $domain 的证书文件吗？" || die "已取消。"
+  snapshot_module certs >/dev/null
+  run rm -rf "$BASE_DIR/certs/$domain"
+}
+
+ssh443_verified() { [[ -f "$BASE_DIR/state/ssh443-verified.env" ]] && grep -q 'SSH_OVER_443_VERIFIED=yes' "$BASE_DIR/state/ssh443-verified.env"; }
+
+cmd_firewall_check() {
+  have ufw && ufw status verbose || warn "未安装 ufw"
+  have nft && nft list ruleset 2>/dev/null | head -n 120 || true
+  echo "Docker 公网端口："
+  docker_public_ports || true
+}
+
+cmd_firewall_stage() {
+  require_root
+  init_layout
+  have ufw || run apt-get install -y ufw
+  docker_public_ports >/tmp/vps-gateway-docker-exposure.$$ 2>/dev/null || true
+  if [[ -s /tmp/vps-gateway-docker-exposure.$$ ]]; then
+    warn "Docker 公网端口映射可能绕过 UFW。严格收紧防火墙前请先检查 docker-check-exposure。"
+    cat /tmp/vps-gateway-docker-exposure.$$
+  fi
+  rm -f /tmp/vps-gateway-docker-exposure.$$ || true
+  if ! ssh443_verified; then
+    warn "尚未标记 SSH over 443 已验证。"
+    warn "请打开一个新终端验证：ssh -p 443 USER@IP"
+    danger_ack "我已验证 SSH over 443" "firewall-stage 将只允许 TCP 443 入站，可能关闭公网 22。" || die "已取消。"
+    cmd_ssh_check --mark-443-verified
+  fi
+  local snap
+  snap="$(snapshot_module firewall)"
+  schedule_rollback "firewall" "firewall" "5m" "$snap"
+  run ufw --force reset
+  run ufw default deny incoming
+  run ufw default allow outgoing
+  run ufw allow in 443/tcp comment "vps-gateway public entry"
+  run ufw --force enable
+  set_module_state firewall configured "only 443 staged"
+  warn "云厂商安全组也需要同步设置为只允许 TCP 443 入站。"
+}
+
+cmd_firewall_confirm() { cancel_rollback firewall; info "防火墙变更已确认。"; }
+cmd_firewall_open() {
+  require_root
+  local port="" proto="tcp"
+  while (($#)); do case "$1" in --port) port="$2"; shift 2 ;; --proto) proto="$2"; shift 2 ;; *) die "未知 firewall-open 参数：$1" ;; esac; done
+  valid_port "$port" || die "端口格式无效"
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || die "协议格式无效"
+  run ufw allow in "${port}/${proto}" comment "vps-gateway manual open"
+}
+cmd_firewall_close() {
+  require_root
+  local port="" proto="tcp"
+  while (($#)); do case "$1" in --port) port="$2"; shift 2 ;; --proto) proto="$2"; shift 2 ;; *) die "未知 firewall-close 参数：$1" ;; esac; done
+  valid_port "$port" || die "端口格式无效"
+  [[ "$port" == "22" ]] && ssh443_verified || true
+  if [[ "$port" == "22" && ! ssh443_verified ]]; then
+    die "未标记 SSH over 443 验证成功，拒绝关闭 22。"
+  fi
+  run ufw deny in "${port}/${proto}"
+}
+cmd_firewall_only_443() { cmd_firewall_stage "$@"; }
+
+cmd_fail2ban_install() { require_root; run apt-get update; run apt-get install -y fail2ban; }
+cmd_fail2ban_config_ssh() {
+  require_root
+  init_layout
+  local port
+  port="$(/usr/sbin/sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+  [[ -n "$port" ]] || port=22
+  warn "如果 SSH 经 Nginx stream 转发，sshd 可能只看到来源 127.0.0.1；Fail2ban 可能无法封禁真实攻击源。"
+  snapshot_module fail2ban >/dev/null
+  write_file /etc/fail2ban/jail.d/vps-gateway-sshd.local <<EOF
+[sshd]
+enabled = true
+port = ${port}
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+findtime = 300
+bantime = 600
+EOF
+  run systemctl enable --now fail2ban
+  run systemctl restart fail2ban
+}
+cmd_fail2ban_status() { fail2ban-client status sshd 2>/dev/null || fail2ban-client status 2>/dev/null || true; }
+
+cmd_login_notify_enable() {
+  require_root
+  init_layout
+  local webhook=""
+  read -rsp "请输入 Webhook URL: " webhook
+  echo
+  [[ -n "$webhook" ]] || die "Webhook 不能为空。"
+  write_file "$BASE_DIR/secrets/webhook.env" <<EOF
+WEBHOOK_URL='$webhook'
+EOF
+  run chmod 600 "$BASE_DIR/secrets/webhook.env"
+  write_file /usr/local/sbin/vps-gateway-login-notify <<'EOF'
+#!/usr/bin/env bash
+set -u
+[[ "${PAM_TYPE:-}" == "open_session" ]] || exit 0
+source /etc/vps-gateway/secrets/webhook.env 2>/dev/null || exit 0
+host="$(hostname 2>/dev/null || echo unknown)"
+msg="SSH login host=${host} user=${PAM_USER:-unknown} from=${PAM_RHOST:-unknown} tty=${PAM_TTY:-unknown}"
+/usr/bin/timeout 8 /usr/bin/curl -fsS --connect-timeout 3 --max-time 6 -H 'Content-Type: application/json' -d "{\"text\":\"${msg}\"}" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+exit 0
+EOF
+  run chmod 700 /usr/local/sbin/vps-gateway-login-notify
+  grep -q 'vps-gateway-login-notify' /etc/pam.d/sshd || run sh -c "printf '%s\n' 'session optional pam_exec.so seteuid /usr/local/sbin/vps-gateway-login-notify' >> /etc/pam.d/sshd"
+}
+cmd_login_notify_disable() {
+  require_root
+  run sed -i.bak '/vps-gateway-login-notify/d' /etc/pam.d/sshd
+}
+cmd_login_notify_test() {
+  PAM_TYPE=open_session PAM_USER="${USER:-root}" PAM_RHOST="test" PAM_TTY="test" /usr/local/sbin/vps-gateway-login-notify || true
+}
+
+cmd_docker_list_ports() {
+  have docker || die "未安装 docker"
+  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
+}
+cmd_docker_check_exposure() {
+  have docker || die "未安装 docker"
+  local exposed
+  exposed="$(docker_public_ports || true)"
+  if [[ -n "$exposed" ]]; then
+    warn "检测到 Docker 公网端口映射。Docker DNAT 可能绕过 UFW："
+    echo "$exposed"
+    return 1
+  fi
+  info "未检测到 Docker 公网端口映射。"
+}
+cmd_docker_suggest_fix() {
+  cat <<'EOF'
+Docker 暴露面修复建议：
+  - Vaultwarden 建议把 "8000:80" 改为 "127.0.0.1:8000:80"。
+  - S-UI 面板端口建议绑定到 127.0.0.1 或 Docker 私有网络。
+  - 修改 docker-compose.yml 前务必先备份。
+  - 确认新绑定地址后再重建容器。
+本命令不会自动修改 docker-compose.yml。
+EOF
+}
+
+cmd_backup() {
+  require_root
+  init_layout
+  snapshot_module ssh >/dev/null
+  snapshot_module nginx >/dev/null
+  snapshot_module firewall >/dev/null
+  snapshot_module routes >/dev/null
+  snapshot_module certs >/dev/null
+  snapshot_module fail2ban >/dev/null
+  info "备份完成。"
+}
+cmd_backup_list() { find "$BASE_DIR/backups" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort; }
+cmd_rollback() {
+  require_root
+  local module="all" snapshot=""
+  while (($#)); do
+    case "$1" in
+      --module) module="$2"; shift 2 ;;
+      --snapshot) snapshot="$2"; shift 2 ;;
+      *) die "未知 rollback 参数：$1" ;;
+    esac
+  done
+  if [[ "$module" == "all" ]]; then
+    for m in ssh nginx firewall routes certs fail2ban; do restore_module "$m" || true; done
+  else
+    restore_module "$module" "$snapshot"
+  fi
+}
+cmd_rollback_status() {
+  [[ -f "$BASE_DIR/state/rollback.json" ]] && cat "$BASE_DIR/state/rollback.json" || echo '{}'
+  have systemctl && systemctl list-timers 'vps-gateway-rollback-*' --all 2>/dev/null || true
+}
+
+cmd_uninstall() {
+  require_root
+  local keep_certs=0 restore_ssh=0 restore_nginx=0
+  while (($#)); do
+    case "$1" in
+      --keep-certs) keep_certs=1; shift ;;
+      --restore-ssh) restore_ssh=1; shift ;;
+      --restore-nginx) restore_nginx=1; shift ;;
+      *) die "未知 uninstall 参数：$1" ;;
+    esac
+  done
+  warn "卸载不会删除 Vaultwarden 或 S-UI 数据。"
+  confirm_prompt "确认执行 vps-gateway 卸载流程吗？" || die "已取消。"
+  ((restore_ssh)) && restore_module ssh || true
+  ((restore_nginx)) && restore_module nginx || true
+  ((keep_certs)) || warn "证书默认保留；如需删除请手动处理 $BASE_DIR/certs。"
+  run rm -f /usr/local/sbin/vps-gateway-login-notify
+  run sed -i.bak '/vps-gateway-login-notify/d' /etc/pam.d/sshd || true
+  warn "状态/配置目录已保留以便审计：$BASE_DIR"
+}
+
+print_command_group() {
+  local title="$1"; shift
+  print_section "$title"
+  printf '%s\n' "$@"
+}
+
+show_main_menu() {
+  print_banner "VPS Gateway 管理面板"
+  print_menu_item 1 "系统自检与安全评分"
+  print_menu_item 2 "用户与 SSH 安全"
+  print_menu_item 3 "Nginx TCP 443 网关"
+  print_menu_item 4 "Reality SNI 路由管理"
+  print_menu_item 5 "添加 / 删除内层 Nginx SNI 路由"
+  print_menu_item 6 "Vaultwarden 安全接入"
+  print_menu_item 7 "S-UI 安全接入"
+  print_menu_item 8 "证书管理"
+  print_menu_item 9 "防火墙管理"
+  print_menu_item 10 "Fail2ban / 登录通知"
+  print_menu_item 11 "Docker 暴露面检查"
+  print_menu_item 12 "备份 / 回滚"
+  print_menu_item 13 "卸载 / 恢复"
+  print_menu_item 14 "退出"
+  printf '\n'
+  ui_line
+}
+
+cmd_menu() {
+  while true; do
+    show_main_menu
+    if ! read -r -p "请选择操作 [1-14]: " c; then
+      echo "已退出 VPS Gateway 管理面板。"
+      exit 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_doctor ;;
+      2) run_menu_action print_command_group "用户与 SSH 安全" \
+        "vps-gateway user-create --name 用户名" \
+        "vps-gateway ssh-import-key --user 用户名 --github GitHub用户名" \
+        "vps-gateway ssh-harden" \
+        "vps-gateway ssh-internalize --port 2222" \
+        "vps-gateway ssh-check" ;;
+      3) run_menu_action print_command_group "Nginx TCP 443 网关" \
+        "vps-gateway gateway-check" \
+        "vps-gateway gateway-install" \
+        "vps-gateway gateway-disable" \
+        "注意：如果 Reality 已占用 443，请使用 Reality 路由管理，不要强行安装通用网关。" ;;
+      4) cmd_reality_menu ;;
+      5) run_menu_action print_command_group "内层 Nginx SNI 路由" \
+        "vps-gateway route-list" \
+        "vps-gateway route-add --sni 域名 --inner-port 8444 --backend 127.0.0.1:8000 --type vaultwarden --cert-domain 域名" \
+        "vps-gateway route-remove --sni 域名" \
+        "vps-gateway route-check --sni 域名" ;;
+      6) run_menu_action print_command_group "Vaultwarden 安全接入" \
+        "vps-gateway vaultwarden-detect" \
+        "vps-gateway vaultwarden-secure" \
+        "vps-gateway vaultwarden-route-add --sni 域名 --inner-port 8444 --backend 127.0.0.1:8000 --cert-domain 域名" \
+        "vps-gateway vaultwarden-admin-protect" \
+        "vps-gateway vaultwarden-backup" ;;
+      7) run_menu_action print_command_group "S-UI 安全接入" \
+        "vps-gateway sui-detect" \
+        "vps-gateway sui-secure" \
+        "vps-gateway sui-route-add --sni 域名 --inner-port 8445 --backend 127.0.0.1:端口 --cert-domain 域名" ;;
+      8) run_menu_action print_command_group "证书管理" \
+        "vps-gateway cert-set-cloudflare" \
+        "vps-gateway cert-issue --domain 域名 --email 邮箱" \
+        "vps-gateway cert-import --domain 域名 --cert /path/fullchain.pem --key /path/privkey.pem" \
+        "vps-gateway cert-status" \
+        "vps-gateway cert-renew" ;;
+      9) run_menu_action print_command_group "防火墙管理" \
+        "vps-gateway firewall-check" \
+        "vps-gateway firewall-stage" \
+        "vps-gateway firewall-confirm" \
+        "vps-gateway firewall-rollback" \
+        "高危提醒：未验证 SSH over 443 前不要关闭公网 22。" ;;
+      10) run_menu_action print_command_group "Fail2ban / 登录通知" \
+        "vps-gateway fail2ban-install" \
+        "vps-gateway fail2ban-config-ssh" \
+        "vps-gateway fail2ban-status" \
+        "vps-gateway login-notify-enable" \
+        "vps-gateway login-notify-disable" ;;
+      11) run_menu_action cmd_docker_check_exposure ;;
+      12) run_menu_action print_command_group "备份 / 回滚" \
+        "vps-gateway backup" \
+        "vps-gateway backup-list" \
+        "vps-gateway rollback --module ssh" \
+        "vps-gateway rollback --module nginx" \
+        "vps-gateway confirm nginx" \
+        "vps-gateway rollback-status" ;;
+      13) run_menu_action print_command_group "卸载 / 恢复" \
+        "vps-gateway uninstall --keep-certs --restore-ssh --restore-nginx" \
+        "卸载不会默认删除 Vaultwarden、S-UI 或证书数据。" ;;
+      14) echo "已退出 VPS Gateway 管理面板。"; exit 0 ;;
+      *) print_warning "无效选项，请输入 1-14 之间的数字。" ;;
+    esac
+  done
+}
+
+dispatch() {
+  case "$COMMAND" in
+    help) usage ;;
+    menu) cmd_menu "${ARGS[@]}" ;;
+    init) cmd_init "${ARGS[@]}" ;;
+    doctor) cmd_doctor "${ARGS[@]}" ;;
+    report) cmd_report "${ARGS[@]}" ;;
+    install-deps) cmd_install_deps "${ARGS[@]}" ;;
+    user-create) cmd_user_create "${ARGS[@]}" ;;
+    ssh-import-key) cmd_ssh_import_key "${ARGS[@]}" ;;
+    ssh-harden) cmd_ssh_harden "${ARGS[@]}" ;;
+    ssh-internalize) cmd_ssh_internalize "${ARGS[@]}" ;;
+    ssh-check) cmd_ssh_check "${ARGS[@]}" ;;
+    ssh-rollback) cmd_rollback --module ssh ;;
+    gateway-install|gateway-enable) cmd_gateway_install "${ARGS[@]}" ;;
+    gateway-disable) cmd_gateway_disable "${ARGS[@]}" ;;
+    gateway-check) cmd_gateway_check "${ARGS[@]}" ;;
+    gateway-rollback) cmd_rollback --module nginx ;;
+    reality-check) cmd_reality_check "${ARGS[@]}" ;;
+    reality-route-list) cmd_reality_route_list "${ARGS[@]}" ;;
+    reality-route-add) cmd_reality_route_add "${ARGS[@]}" ;;
+    reality-route-remove) cmd_reality_route_remove "${ARGS[@]}" ;;
+    reality-route-set-default) cmd_reality_route_set_default "${ARGS[@]}" ;;
+    reality-menu) cmd_reality_menu "${ARGS[@]}" ;;
+    route-add) cmd_route_add "${ARGS[@]}" ;;
+    route-remove) cmd_route_remove "${ARGS[@]}" ;;
+    route-list) cmd_route_list "${ARGS[@]}" ;;
+    route-check) cmd_route_check "${ARGS[@]}" ;;
+    route-disable) cmd_route_disable "${ARGS[@]}" ;;
+    route-enable) cmd_route_enable "${ARGS[@]}" ;;
+    vaultwarden-detect) cmd_vaultwarden_detect "${ARGS[@]}" ;;
+    vaultwarden-secure) cmd_vaultwarden_secure "${ARGS[@]}" ;;
+    vaultwarden-route-add) cmd_vaultwarden_route_add "${ARGS[@]}" ;;
+    vaultwarden-check) cmd_vaultwarden_check "${ARGS[@]}" ;;
+    vaultwarden-admin-protect) cmd_vaultwarden_admin_protect "${ARGS[@]}" ;;
+    vaultwarden-backup) cmd_vaultwarden_backup "${ARGS[@]}" ;;
+    sui-detect) cmd_sui_detect "${ARGS[@]}" ;;
+    sui-secure) cmd_sui_secure "${ARGS[@]}" ;;
+    sui-route-add) cmd_sui_route_add "${ARGS[@]}" ;;
+    sui-check) cmd_sui_check "${ARGS[@]}" ;;
+    cert-install-acme) cmd_cert_install_acme "${ARGS[@]}" ;;
+    cert-set-cloudflare) cmd_cert_set_cloudflare "${ARGS[@]}" ;;
+    cert-issue) cmd_cert_issue "${ARGS[@]}" ;;
+    cert-import) cmd_cert_import "${ARGS[@]}" ;;
+    cert-renew) cmd_cert_renew "${ARGS[@]}" ;;
+    cert-status) cmd_cert_status "${ARGS[@]}" ;;
+    cert-list) cmd_cert_list "${ARGS[@]}" ;;
+    cert-remove) cmd_cert_remove "${ARGS[@]}" ;;
+    firewall-check) cmd_firewall_check "${ARGS[@]}" ;;
+    firewall-stage|firewall-only-443) cmd_firewall_stage "${ARGS[@]}" ;;
+    firewall-confirm) cmd_firewall_confirm "${ARGS[@]}" ;;
+    firewall-rollback) cmd_rollback --module firewall ;;
+    firewall-open) cmd_firewall_open "${ARGS[@]}" ;;
+    firewall-close) cmd_firewall_close "${ARGS[@]}" ;;
+    fail2ban-install) cmd_fail2ban_install "${ARGS[@]}" ;;
+    fail2ban-config-ssh) cmd_fail2ban_config_ssh "${ARGS[@]}" ;;
+    fail2ban-status) cmd_fail2ban_status "${ARGS[@]}" ;;
+    login-notify-enable) cmd_login_notify_enable "${ARGS[@]}" ;;
+    login-notify-disable) cmd_login_notify_disable "${ARGS[@]}" ;;
+    login-notify-test) cmd_login_notify_test "${ARGS[@]}" ;;
+    docker-check-exposure) cmd_docker_check_exposure "${ARGS[@]}" ;;
+    docker-list-ports) cmd_docker_list_ports "${ARGS[@]}" ;;
+    docker-suggest-fix) cmd_docker_suggest_fix "${ARGS[@]}" ;;
+    backup) cmd_backup "${ARGS[@]}" ;;
+    backup-list) cmd_backup_list "${ARGS[@]}" ;;
+    rollback) cmd_rollback "${ARGS[@]}" ;;
+    confirm) cancel_rollback "${ARGS[0]:-all}" ;;
+    rollback-status) cmd_rollback_status "${ARGS[@]}" ;;
+    uninstall) cmd_uninstall "${ARGS[@]}" ;;
+    *) usage; die "未知命令：$COMMAND" ;;
+  esac
+}
+
+parse_global_args "$@"
+dispatch
