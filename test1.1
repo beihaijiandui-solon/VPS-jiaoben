@@ -392,12 +392,10 @@ restore_module() {
       [[ -f "$snap/ssh-socket.d.tar.gz" ]] && run tar -C /etc/systemd/system -xzf "$snap/ssh-socket.d.tar.gz"
       [[ -f "$snap/ssh-service.d.tar.gz" ]] && run tar -C /etc/systemd/system -xzf "$snap/ssh-service.d.tar.gz"
       run systemctl daemon-reload
-      validate_sshd
       reload_ssh
       ;;
     nginx)
       [[ -f "$snap/nginx.tar.gz" ]] && run tar -C /etc -xzf "$snap/nginx.tar.gz"
-      validate_nginx
       reload_nginx
       ;;
     firewall)
@@ -408,7 +406,6 @@ restore_module() {
       [[ -f "$snap/routes.d.tar.gz" ]] && run tar -C "$BASE_DIR" -xzf "$snap/routes.d.tar.gz"
       [[ -f "$snap/stream.d.tar.gz" ]] && run tar -C /etc/nginx -xzf "$snap/stream.d.tar.gz"
       [[ -f "$snap/conf.d.tar.gz" ]] && run tar -C /etc/nginx -xzf "$snap/conf.d.tar.gz"
-      validate_nginx
       reload_nginx
       ;;
     certs)
@@ -496,6 +493,32 @@ validate_nginx() {
 reload_nginx() {
   validate_nginx
   run systemctl reload nginx
+}
+
+lint_generated_nginx_conf() {
+  local files=()
+  if [[ -d "$NGINX_STREAM_DIR" ]]; then
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$NGINX_STREAM_DIR" -type f -name '*.conf' -print0 2>/dev/null || true)
+  fi
+  if [[ -d "$NGINX_HTTP_DIR" ]]; then
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$NGINX_HTTP_DIR" -type f -name '*.conf' -print0 2>/dev/null || true)
+  fi
+  local has_error=0
+  for f in "${files[@]}"; do
+    if grep -qE 'listen\[' "$f"; then
+      print_error "检测到疑似错误写法 listen[ 在文件 $f 中，应为 listen[。"
+      has_error=1
+    fi
+    if grep -qE '(^|[[:space:]])(listen127|listen0\.|server_name[A-Za-z0-9]|proxy_passhttp|proxy_pass127|ssl_certificate/|ssl_certificate_key/)' "$f"; then
+      print_error "文件 $f 中检测到常见指令与参数粘连错误。"
+      has_error=1
+    fi
+    if grep -qE 'ssl_certificate[[:space:]]*;' "$f" || grep -qE 'ssl_certificate_key[[:space:]]*;' "$f"; then
+      print_error "文件 $f 中检测到空证书路径配置。"
+      has_error=1
+    fi
+  done
+  return "$has_error"
 }
 
 cmd_init() {
@@ -783,7 +806,16 @@ cmd_ssh_harden() {
   local snap
   snap="$(snapshot_module ssh)"
   write_ssh_dropin "" 0
-  validate_sshd
+  
+  local sshd_bin
+  sshd_bin="$(command -v sshd || command -v /usr/sbin/sshd || true)"
+  if [[ -n "$sshd_bin" ]] && ! "$sshd_bin" -t >/dev/null 2>&1; then
+    warn "SSHD 配置验证失败。"
+    info "正在自动回滚本次修改..."
+    restore_module ssh "$snap"
+    die "配置验证失败，已自动回滚。"
+  fi
+
   schedule_rollback "ssh" "ssh" "5m" "$snap"
   reload_ssh
   set_module_state ssh configured "hardened"
@@ -810,7 +842,16 @@ cmd_ssh_internalize() {
   local snap
   snap="$(snapshot_module ssh)"
   write_ssh_dropin "$port" 1
-  validate_sshd
+  
+  local sshd_bin
+  sshd_bin="$(command -v sshd || command -v /usr/sbin/sshd || true)"
+  if [[ -n "$sshd_bin" ]] && ! "$sshd_bin" -t >/dev/null 2>&1; then
+    warn "SSHD 配置验证失败。"
+    info "正在自动回滚本次修改..."
+    restore_module ssh "$snap"
+    die "配置验证失败，已自动回滚。"
+  fi
+
   schedule_rollback "ssh" "ssh" "5m" "$snap"
   if systemctl is-active --quiet ssh.socket 2>/dev/null; then
     warn "ssh.socket 当前处于启用状态。将禁用 socket activation，以便 sshd_config 的 ListenAddress/Port 生效。"
@@ -924,10 +965,18 @@ EOF
   else
     disable_nginx_conf_if_present "$NGINX_STREAM_DIR/91-gateway-udp.conf"
   fi
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置验证失败，网关未启用。"
+    info "正在自动回滚本次修改..."
+    restore_module nginx "$snap"
+    die "配置验证未通过，已回滚。请修复配置后重试。"
+  fi
+
   schedule_rollback "nginx" "nginx" "5m" "$snap"
   reload_nginx
   set_module_state nginx configured "stream gateway installed:${proto}"
+  info "网关已启用：${proto}"
 }
 
 disable_nginx_conf_if_present() {
@@ -951,7 +1000,8 @@ ensure_nginx_stream_include() {
   if ((DRY_RUN)); then
     info "预览模式：将在 $conf 末尾追加 stream include 块"
   else
-    cp -a "$conf" "$conf.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    local bak="$conf.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    cp -a "$conf" "$bak"
     cat >>"$conf" <<'EOF'
 
 # Managed by vps-gateway.
@@ -959,6 +1009,10 @@ stream {
     include /etc/nginx/stream.d/*.conf;
 }
 EOF
+    if ! nginx -t; then
+      mv "$bak" "$conf"
+      die "自动追加 stream 块导致 Nginx 配置错误并已还原。请手动检查并添加 stream include。"
+    fi
   fi
   info "nginx.conf 已纳入 Nginx 快照：$snap"
 }
@@ -973,7 +1027,14 @@ cmd_gateway_disable() {
   disable_nginx_conf_if_present "$NGINX_STREAM_DIR/90-gateway.conf"
   disable_nginx_conf_if_present "$NGINX_STREAM_DIR/90-gateway-tcp.conf"
   disable_nginx_conf_if_present "$NGINX_STREAM_DIR/91-gateway-udp.conf"
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置验证失败，禁用网关操作导致异常。"
+    info "正在自动回滚本次修改..."
+    restore_module nginx "$snap"
+    die "配置错误已被回滚。"
+  fi
+
   schedule_rollback "nginx" "nginx" "5m" "$snap"
   reload_nginx
   set_module_state nginx disabled "gateway disabled"
@@ -1163,7 +1224,14 @@ cmd_reality_route_add() {
   local snap
   snap="$(snapshot_module nginx)"
   reality_rewrite_route "$file" "$sni" "$backend" "add"
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置测试失败，Reality 路由未启用。"
+    info "正在自动回滚本次修改..."
+    restore_module nginx "$snap"
+    die "配置错误已被回滚。"
+  fi
+
   schedule_rollback "nginx" "nginx" "5m" "$snap"
   reload_nginx
   info "Reality 路由已设置：$sni -> $backend"
@@ -1186,7 +1254,14 @@ cmd_reality_route_remove() {
   local snap
   snap="$(snapshot_module nginx)"
   reality_rewrite_route "$file" "$sni" "" "remove"
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置测试失败，删除操作导致异常。"
+    info "正在自动回滚本次修改..."
+    restore_module nginx "$snap"
+    die "配置错误已被回滚。"
+  fi
+
   schedule_rollback "nginx" "nginx" "5m" "$snap"
   reload_nginx
   info "Reality 路由已删除：$sni"
@@ -1208,7 +1283,14 @@ cmd_reality_route_set_default() {
   local snap
   snap="$(snapshot_module nginx)"
   reality_set_default_backend "$file" "$backend"
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置测试失败，修改默认后端导致异常。"
+    info "正在自动回滚本次修改..."
+    restore_module nginx "$snap"
+    die "配置错误已被回滚。"
+  fi
+
   schedule_rollback "nginx" "nginx" "5m" "$snap"
   reload_nginx
   info "Reality 默认后端已设置为 $backend"
@@ -1416,7 +1498,14 @@ server {
     proxy_pass ${backend};
 }
 EOF
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置验证失败，UDP 路由未启用。"
+    info "正在自动回滚本次修改..."
+    restore_module routes "$snap"
+    die "配置验证未通过，已自动回滚。请修复配置后重试。"
+  fi
+
   schedule_rollback "routes" "routes" "5m" "$snap"
   reload_nginx
   write_udp_route_state "$name" "$listen_port" "$backend"
@@ -1541,7 +1630,13 @@ cmd_route_add() {
     add_stream_route_line "$sni" "$inner_port"
   fi
   
-  validate_nginx
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置验证失败，路由未启用。"
+    info "正在自动回滚本次修改..."
+    restore_module routes "$snap"
+    die "配置验证未通过，已自动回滚。请修复配置后重试。"
+  fi
+  
   schedule_rollback "routes" "routes" "5m" "$snap"
   reload_nginx
   write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "true" "enabled"
@@ -1566,7 +1661,14 @@ cmd_route_remove() {
   [[ -f "$(inner_conf_path "$sni")" ]] && run rm -f "$(inner_conf_path "$sni")"
   [[ -f "$(route_json_path "$sni")" ]] && run rm -f "$(route_json_path "$sni")"
   rebuild_routes_index
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置验证失败，删除操作导致异常。"
+    info "正在自动回滚本次修改..."
+    restore_module routes "$snap"
+    die "配置验证未通过，已自动回滚。"
+  fi
+
   schedule_rollback "routes" "routes" "5m" "$snap"
   reload_nginx
 }
@@ -1591,7 +1693,14 @@ cmd_route_disable() {
   snap="$(snapshot_module routes)"
   remove_stream_route_line "$sni"
   [[ -f "$(inner_conf_path "$sni")" ]] && run mv "$(inner_conf_path "$sni")" "$(inner_conf_path "$sni").disabled"
-  validate_nginx
+  
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置验证失败，禁用操作导致异常。"
+    info "正在自动回滚本次修改..."
+    restore_module routes "$snap"
+    die "配置验证未通过，已自动回滚。"
+  fi
+
   schedule_rollback "routes" "routes" "5m" "$snap"
   reload_nginx
   info "路由已禁用：$sni"
@@ -1623,14 +1732,24 @@ cmd_route_enable() {
   if [[ "$type" == "tcp-pass-through" ]]; then
     add_stream_route_backend_line "$sni" "$backend"
   else
-    generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
+    [[ -f "$(inner_conf_path "$sni").disabled" ]] && run mv "$(inner_conf_path "$sni").disabled" "$(inner_conf_path "$sni")"
+    if [[ ! -f "$(inner_conf_path "$sni")" ]]; then
+      generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
+    fi
     add_stream_route_line "$sni" "$inner_port"
   fi
   
-  validate_nginx
+  if ! lint_generated_nginx_conf || ! nginx -t; then
+    warn "Nginx 配置验证失败，启用操作导致异常。"
+    info "正在自动回滚本次修改..."
+    restore_module routes "$snap"
+    die "配置验证未通过，已自动回滚。"
+  fi
+
   schedule_rollback "routes" "routes" "5m" "$snap"
   reload_nginx
   write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "true" "enabled"
+  info "路由已启用：$sni"
 }
 
 cmd_route_check() {
@@ -2090,7 +2209,7 @@ cmd_ssh_import_key_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择导入方式 [1-4]: " c; then
+    if ! read -r -p "请选择操作 [1-4]: " c; then
       echo "已返回用户与 SSH 安全菜单。"
       return 0
     fi
@@ -2187,7 +2306,7 @@ cmd_ssh_menu() {
       4)
         ensure_openssh_interactive || continue
         local port=""
-        read -r -p "请输入 OpenSSH 内部监听端口[默认 2222]: " port
+        read -r -p "请输入 OpenSSH 内部监听端口 [默认 2222]: " port
         port="${port//$'\r'/}"
         [[ -n "$port" ]] || port="2222"
         if ! valid_port "$port"; then
@@ -2334,7 +2453,7 @@ install_nginx_org_repo() {
   run apt-get install -y curl gnupg ca-certificates lsb-release
   run mkdir -p /etc/apt/keyrings
   run sh -c "curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg"
-  run sh -c "printf 'deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
+  run sh -c "printf 'deb[signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
   run apt-get update
   run apt-get install -y nginx
 }
@@ -2552,7 +2671,7 @@ ensure_docker_interactive() {
     fi
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作: " c; then
+    if ! read -r -p "请选择操作 [1-4]: " c; then
       return 1
     fi
     c="${c//$'\r'/}"
@@ -2597,7 +2716,7 @@ cmd_gateway_install_proto_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作[1-4]: " c; then
+    if ! read -r -p "请选择操作 [1-4]: " c; then
       return 0
     fi
     c="${c//$'\r'/}"
@@ -2651,7 +2770,7 @@ cmd_gateway_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作[1-4]: " c; then
+    if ! read -r -p "请选择操作 [1-4]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2803,7 +2922,7 @@ cmd_route_add_protocol_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作[1-4]: " c; then
       return 0
     fi
     c="${c//$'\r'/}"
@@ -2898,7 +3017,7 @@ cmd_vaultwarden_menu() {
     print_menu_item 6 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-6]: " c; then
+    if ! read -r -p "请选择操作[1-6]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2923,8 +3042,8 @@ cmd_vaultwarden_menu() {
         ensure_nginx_interactive || continue
         local sni="" inner_port="" backend=""
         if ! sni="$(prompt_required "请输入 Vaultwarden 访问域名 SNI: ")"; then pause_return; continue; fi
-        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口[默认 8444]: " "8444")"; then pause_return; continue; fi
-        backend="$(prompt_optional "请输入 Vaultwarden 后端地址[默认 127.0.0.1:8000]: " "127.0.0.1:8000")"
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8444]: " "8444")"; then pause_return; continue; fi
+        backend="$(prompt_optional "请输入 Vaultwarden 后端地址 [默认 127.0.0.1:8000]: " "127.0.0.1:8000")"
         prompt_cert_source_for_route "$sni" "vaultwarden" "$inner_port" "$backend"
         ;;
       4) run_menu_action cmd_vaultwarden_admin_protect ;;
@@ -2946,7 +3065,7 @@ cmd_sui_menu() {
     print_menu_item 6 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作[1-6]: " c; then
+    if ! read -r -p "请选择操作 [1-6]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2960,7 +3079,7 @@ cmd_sui_menu() {
         ensure_nginx_interactive || continue
         local sni="" inner_port="" backend=""
         if ! sni="$(prompt_required "请输入 S-UI 访问域名 SNI: ")"; then pause_return; continue; fi
-        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8445]: " "8445")"; then pause_return; continue; fi
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口[默认 8445]: " "8445")"; then pause_return; continue; fi
         if ! backend="$(prompt_required "请输入 S-UI 后端地址，例如 127.0.0.1:2095: ")"; then pause_return; continue; fi
         prompt_cert_source_for_route "$sni" "sui" "$inner_port" "$backend"
         ;;
@@ -3118,7 +3237,7 @@ cmd_firewall_close_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作[1-4]: " c; then
       return 0
     fi
     c="${c//$'\r'/}"
@@ -3161,7 +3280,7 @@ cmd_firewall_menu() {
     print_menu_item 7 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-7]: " c; then
+    if ! read -r -p "请选择操作[1-7]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -3300,7 +3419,7 @@ cmd_backup_menu() {
         ;;
       5)
         local tag=""
-        tag="$(prompt_optional "请输入要确认取消的回滚 tag[默认 all]: " "all")"
+        tag="$(prompt_optional "请输入要确认取消的回滚 tag [默认 all]: " "all")"
         run_menu_action cancel_rollback "$tag"
         ;;
       6) return 0 ;;
@@ -3347,6 +3466,17 @@ cmd_uninstall_menu() {
   done
 }
 
+cmd_self_lint() {
+  echo "自检开始..."
+  bash -n "$SELF_PATH" || die "bash -n 失败"
+  if grep -nE 'listen\[' "$SELF_PATH"; then die "检测到 listen[ 错误"; fi
+  if grep -nE '请选择操作\[' "$SELF_PATH"; then die "检测到 请选择操作[ 错误"; fi
+  if grep -nE '端口\[默认' "$SELF_PATH"; then die "检测到 端口[默认 错误"; fi
+  if grep -nE '地址\[默认' "$SELF_PATH"; then die "检测到 地址[默认 错误"; fi
+  if grep -nE 'tag\[默认' "$SELF_PATH"; then die "检测到 tag[默认 错误"; fi
+  echo "自检通过 ✅"
+}
+
 print_command_group() {
   local title="$1"; shift
   print_section "$title"
@@ -3376,7 +3506,7 @@ show_main_menu() {
 cmd_menu() {
   while true; do
     show_main_menu
-    if ! read -r -p "请选择操作[1-14]: " c; then
+    if ! read -r -p "请选择操作 [1-14]: " c; then
       echo "已退出 VPS Gateway 管理面板。"
       exit 0
     fi
@@ -3471,6 +3601,7 @@ dispatch() {
     confirm) cancel_rollback "${ARGS[0]:-all}" ;;
     rollback-status) cmd_rollback_status "${ARGS[@]}" ;;
     uninstall) cmd_uninstall "${ARGS[@]}" ;;
+    self-lint) cmd_self_lint ;;
     *) usage; die "未知命令：$COMMAND" ;;
   esac
 }
