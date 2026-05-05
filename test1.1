@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -238,7 +240,7 @@ print_info() {
 
 pause_return() {
   [[ -t 0 ]] || return 0
-  printf '\n按 Enter 返回主菜单...'
+  printf '\n按 Enter 返回上一级...'
   read -r _
 }
 
@@ -1429,7 +1431,7 @@ generate_inner_nginx_conf() {
 # Managed by vps-gateway.
 server {
     listen 127.0.0.1:${inner_port} ssl;
-    listen [::1]:${inner_port} ssl;
+    listen[::1]:${inner_port} ssl;
     http2 on;
     server_name ${sni};
 
@@ -1464,7 +1466,20 @@ EOF
   if route_line_exists "$sni"; then
     run sed -i.bak -E "s|^[[:space:]]*${sni//./\\.}[[:space:]].*|    ${sni} 127.0.0.1:${inner_port};|" "$NGINX_STREAM_DIR/20-sni-routes.conf"
   else
-    run sh -c "printf '    %s 127.0.0.1:%s;\n' '$sni' '$inner_port' >> '$NGINX_STREAM_DIR/20-sni-routes.conf'"
+    run sh -c "printf '    %-34s 127.0.0.1:%s;\n' '$sni' '$inner_port' >> '$NGINX_STREAM_DIR/20-sni-routes.conf'"
+  fi
+}
+
+add_stream_route_backend_line() {
+  local sni="$1" backend="$2"
+  run mkdir -p "$NGINX_STREAM_DIR"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
+# Managed by vps-gateway.
+EOF
+  if route_line_exists "$sni"; then
+    run sed -i.bak -E "s|^[[:space:]]*${sni//./\\.}[[:space:]].*|    ${sni} ${backend};|" "$NGINX_STREAM_DIR/20-sni-routes.conf"
+  else
+    run sh -c "printf '    %-34s %s;\n' '$sni' '$backend' >> '$NGINX_STREAM_DIR/20-sni-routes.conf'"
   fi
 }
 
@@ -1491,14 +1506,22 @@ cmd_route_add() {
     esac
   done
   valid_sni "$sni" || die "--sni 格式无效"
-  valid_port "$inner_port" || die "--inner-port 格式无效"
+  
+  if [[ "$type" != "tcp-pass-through" ]]; then
+    valid_port "$inner_port" || die "--inner-port 格式无效"
+    [[ -z "$(inner_port_conflict "$inner_port" "$sni")" ]] || die "内层端口冲突：$inner_port"
+  else
+    inner_port="0"
+  fi
+  
   backend_is_safe "$backend" || die "后端必须是回环/内部地址，不能配置为 0.0.0.0。"
-  [[ -z "$(inner_port_conflict "$inner_port" "$sni")" ]] || die "内层端口冲突：$inner_port"
-  if [[ -z "$cert" && -z "$key" ]]; then
+  
+  if [[ -z "$cert" && -z "$key" && "$type" != "tcp-pass-through" ]]; then
     local d="${cert_domain:-$sni}"
     cert="$BASE_DIR/certs/$d/fullchain.pem"
     key="$BASE_DIR/certs/$d/privkey.pem"
   fi
+  
   if [[ "$type" == "tcp-pass-through" ]]; then
     cert=""
     key=""
@@ -1507,19 +1530,27 @@ cmd_route_add() {
     write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "false" "pending_cert"
     return 0
   fi
+  
   local snap
   snap="$(snapshot_module routes)"
+  
   if [[ "$type" == "tcp-pass-through" ]]; then
-    add_stream_route_line "$sni" "${backend##*:}"
+    add_stream_route_backend_line "$sni" "$backend"
   else
     generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
     add_stream_route_line "$sni" "$inner_port"
   fi
+  
   validate_nginx
   schedule_rollback "routes" "routes" "5m" "$snap"
   reload_nginx
   write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "true" "enabled"
-  info "路由已启用：${sni} -> 127.0.0.1:${inner_port} -> ${backend}"
+  
+  if [[ "$type" == "tcp-pass-through" ]]; then
+    info "TCP 透传路由已启用：${sni} -> ${backend}"
+  else
+    info "路由已启用：${sni} -> 127.0.0.1:${inner_port} -> ${backend}"
+  fi
 }
 
 cmd_route_remove() {
@@ -1585,10 +1616,17 @@ cmd_route_enable() {
     key="$(grep -o '"key":"[^"]*' "$json" | cut -d\" -f4)"
   fi
   [[ "$type" == "tcp-pass-through" || ( -f "$cert" && -f "$key" ) ]] || die "$sni 缺少证书文件"
+  
   local snap
   snap="$(snapshot_module routes)"
-  [[ "$type" == "tcp-pass-through" ]] || generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
-  add_stream_route_line "$sni" "$inner_port"
+  
+  if [[ "$type" == "tcp-pass-through" ]]; then
+    add_stream_route_backend_line "$sni" "$backend"
+  else
+    generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
+    add_stream_route_line "$sni" "$inner_port"
+  fi
+  
   validate_nginx
   schedule_rollback "routes" "routes" "5m" "$snap"
   reload_nginx
@@ -1784,6 +1822,36 @@ cmd_cert_remove() {
   confirm_prompt "确认删除 $domain 的证书文件吗？" || die "已取消。"
   snapshot_module certs >/dev/null
   run rm -rf "$BASE_DIR/certs/$domain"
+}
+
+cmd_cert_find() {
+  print_section "查找常见证书路径"
+  print_info "正在轻量扫描常见证书目录..."
+  local search_dirs=(
+    "/etc/vps-gateway/certs"
+    "/etc/letsencrypt/live"
+    "/root/.acme.sh"
+    "/etc/ssl"
+    "/etc/nginx/certs"
+    "/opt"
+  )
+  
+  local found=0
+  for dir in "${search_dirs[@]}"; do
+    if [[ -d "$dir" ]]; then
+      while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        found=1
+        stat -c '%A  %U:%G  %n' "$file" 2>/dev/null || ls -l "$file" | awk '{print $1"  "$3":"$4"  "$9}'
+      done < <(find "$dir" -maxdepth 4 -type f \( -iname "fullchain.pem" -o -iname "privkey.pem" -o -iname "cert.pem" -o -iname "chain.pem" -o -iname "*.cer" -o -iname "*.key" -o -iname "*.crt" \) 2>/dev/null)
+    fi
+  done
+  
+  if ((found)); then
+    print_info "扫描完成。如果发现成对的 fullchain / privkey，可以在路由配置【手动指定证书文件路径】时直接复制使用。"
+  else
+    print_warning "未在常见目录中找到证书文件。"
+  fi
 }
 
 ssh443_verified() { [[ -f "$BASE_DIR/state/ssh443-verified.env" ]] && grep -q 'SSH_OVER_443_VERIFIED=yes' "$BASE_DIR/state/ssh443-verified.env"; }
@@ -2119,7 +2187,7 @@ cmd_ssh_menu() {
       4)
         ensure_openssh_interactive || continue
         local port=""
-        read -r -p "请输入 OpenSSH 内部监听端口 [默认 2222]: " port
+        read -r -p "请输入 OpenSSH 内部监听端口[默认 2222]: " port
         port="${port//$'\r'/}"
         [[ -n "$port" ]] || port="2222"
         if ! valid_port "$port"; then
@@ -2529,7 +2597,7 @@ cmd_gateway_install_proto_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作[1-4]: " c; then
       return 0
     fi
     c="${c//$'\r'/}"
@@ -2583,7 +2651,7 @@ cmd_gateway_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作[1-4]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2623,18 +2691,97 @@ prompt_udp_route_backend() {
   printf '%s' "$backend"
 }
 
-prompt_tcp_route_args() {
-  local sni="" inner_port="" backend="" type="" cert_domain=""
-  if ! sni="$(prompt_required "请输入 SNI 域名: ")"; then return 1; fi
-  if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口: " "")"; then return 1; fi
-  if ! backend="$(prompt_required "请输入后端地址，例如 127.0.0.1:8000: ")"; then return 1; fi
-  type="$(prompt_optional "请输入路由类型 [默认 generic]: " "generic")"
-  cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
-  TCP_ROUTE_SNI="$sni"
-  TCP_ROUTE_INNER_PORT="$inner_port"
-  TCP_ROUTE_BACKEND="$backend"
-  TCP_ROUTE_TYPE="$type"
-  TCP_ROUTE_CERT_DOMAIN="$cert_domain"
+prompt_cert_source_for_route() {
+  local sni="$1" type="$2" inner_port="$3" backend="$4"
+  while true; do
+    print_banner "选择路由证书来源"
+    print_menu_item 1 "使用脚本内部证书目录：/etc/vps-gateway/certs/<域名>/"
+    print_menu_item 2 "手动指定证书文件路径"
+    print_menu_item 3 "暂不提供证书，只创建 pending_cert 路由"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      return 1
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        local cert_domain=""
+        cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
+        run_menu_action cmd_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --type "$type" --cert-domain "$cert_domain"
+        return 0
+        ;;
+      2)
+        local cert="" key=""
+        if ! cert="$(prompt_required "请输入 fullchain.pem 路径: ")"; then continue; fi
+        if ! key="$(prompt_required "请输入 privkey.pem 路径: ")"; then continue; fi
+        if [[ ! -f "$cert" ]]; then
+          print_error "文件不存在：$cert"
+          pause_return
+          continue
+        fi
+        if [[ ! -f "$key" ]]; then
+          print_error "文件不存在：$key"
+          pause_return
+          continue
+        fi
+        run_menu_action cmd_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --type "$type" --cert "$cert" --key "$key"
+        return 0
+        ;;
+      3)
+        print_info "当前不会启用该路由，只会创建 pending_cert 状态。导入或签发证书后，需要重新启用 / 更新该路由。"
+        pause_return
+        run_menu_action cmd_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --type "$type" --cert-domain "$sni"
+        return 0
+        ;;
+      4)
+        return 1
+        ;;
+      *)
+        print_warning "无效选项，请输入 1-4 之间的数字。"
+        ;;
+    esac
+  done
+}
+
+prompt_tcp_route_interactive() {
+  while true; do
+    print_banner "选择 TCP 路由类型"
+    print_menu_item 1 "HTTPS 反向代理：需要 Nginx 证书"
+    print_menu_item 2 "TLS / Reality / TCP 透传：不需要 Nginx 证书"
+    print_menu_item 3 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-3]: " tc; then
+      return 1
+    fi
+    tc="${tc//$'\r'/}"
+    case "$tc" in
+      1)
+        local sni="" inner_port="" backend="" type=""
+        if ! sni="$(prompt_required "请输入 SNI 域名: ")"; then pause_return; continue; fi
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口: " "")"; then pause_return; continue; fi
+        if ! backend="$(prompt_required "请输入后端地址，例如 127.0.0.1:8000: ")"; then pause_return; continue; fi
+        type="$(prompt_optional "请输入路由类型 [默认 generic]: " "generic")"
+        prompt_cert_source_for_route "$sni" "$type" "$inner_port" "$backend"
+        return 0
+        ;;
+      2)
+        local sni="" backend=""
+        if ! sni="$(prompt_required "请输入 SNI 域名: ")"; then pause_return; continue; fi
+        if ! backend="$(prompt_required "请输入后端地址，例如 127.0.0.1:6443: ")"; then pause_return; continue; fi
+        run_menu_action cmd_route_add --sni "$sni" --inner-port "0" --backend "$backend" --type "tcp-pass-through"
+        return 0
+        ;;
+      3)
+        return 1
+        ;;
+      *)
+        print_warning "无效选项，请输入 1-3 之间的数字。"
+        ;;
+    esac
+  done
 }
 
 prompt_udp_route_args() {
@@ -2663,8 +2810,7 @@ cmd_route_add_protocol_menu() {
     case "$c" in
       1)
         ensure_nginx_interactive || continue
-        if ! prompt_tcp_route_args; then pause_return; continue; fi
-        run_menu_action cmd_route_add --sni "$TCP_ROUTE_SNI" --inner-port "$TCP_ROUTE_INNER_PORT" --backend "$TCP_ROUTE_BACKEND" --type "$TCP_ROUTE_TYPE" --cert-domain "$TCP_ROUTE_CERT_DOMAIN"
+        prompt_tcp_route_interactive
         ;;
       2)
         ensure_nginx_stream_only_interactive || continue
@@ -2673,11 +2819,10 @@ cmd_route_add_protocol_menu() {
         ;;
       3)
         ensure_nginx_stream_interactive || continue
-        if ! prompt_tcp_route_args; then pause_return; continue; fi
         if ! prompt_udp_route_args; then pause_return; continue; fi
-        menu_try cmd_route_add --sni "$TCP_ROUTE_SNI" --inner-port "$TCP_ROUTE_INNER_PORT" --backend "$TCP_ROUTE_BACKEND" --type "$TCP_ROUTE_TYPE" --cert-domain "$TCP_ROUTE_CERT_DOMAIN" || true
         menu_try cmd_udp_route_add --name "$UDP_ROUTE_NAME" --listen-port "$UDP_ROUTE_LISTEN_PORT" --backend "$UDP_ROUTE_BACKEND" || true
-        pause_return
+        print_info "请继续配置对应的 TCP 路由（HTTPS 反向代理或 TCP 透传）..."
+        prompt_tcp_route_interactive
         ;;
       4) return 0 ;;
       *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
@@ -2776,12 +2921,11 @@ cmd_vaultwarden_menu() {
           esac
         fi
         ensure_nginx_interactive || continue
-        local sni="" inner_port="" backend="" cert_domain=""
+        local sni="" inner_port="" backend=""
         if ! sni="$(prompt_required "请输入 Vaultwarden 访问域名 SNI: ")"; then pause_return; continue; fi
-        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8444]: " "8444")"; then pause_return; continue; fi
-        backend="$(prompt_optional "请输入 Vaultwarden 后端地址 [默认 127.0.0.1:8000]: " "127.0.0.1:8000")"
-        cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
-        run_menu_action cmd_vaultwarden_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --cert-domain "$cert_domain"
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口[默认 8444]: " "8444")"; then pause_return; continue; fi
+        backend="$(prompt_optional "请输入 Vaultwarden 后端地址[默认 127.0.0.1:8000]: " "127.0.0.1:8000")"
+        prompt_cert_source_for_route "$sni" "vaultwarden" "$inner_port" "$backend"
         ;;
       4) run_menu_action cmd_vaultwarden_admin_protect ;;
       5) run_menu_action cmd_vaultwarden_backup ;;
@@ -2798,10 +2942,11 @@ cmd_sui_menu() {
     print_menu_item 2 "安装 / 更新 S-UI 面板"
     print_menu_item 3 "检查 S-UI 暴露风险"
     print_menu_item 4 "添加 S-UI SNI 路由"
-    print_menu_item 5 "返回上一级"
+    print_menu_item 5 "删除 S-UI SNI 路由"
+    print_menu_item 6 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-5]: " c; then
+    if ! read -r -p "请选择操作[1-6]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2813,15 +2958,25 @@ cmd_sui_menu() {
       4)
         ensure_sui_interactive || continue
         ensure_nginx_interactive || continue
-        local sni="" inner_port="" backend="" cert_domain=""
+        local sni="" inner_port="" backend=""
         if ! sni="$(prompt_required "请输入 S-UI 访问域名 SNI: ")"; then pause_return; continue; fi
         if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8445]: " "8445")"; then pause_return; continue; fi
         if ! backend="$(prompt_required "请输入 S-UI 后端地址，例如 127.0.0.1:2095: ")"; then pause_return; continue; fi
-        cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
-        run_menu_action cmd_sui_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --cert-domain "$cert_domain"
+        prompt_cert_source_for_route "$sni" "sui" "$inner_port" "$backend"
         ;;
-      5) return 0 ;;
-      *) print_warning "无效选项，请输入 1-5 之间的数字。" ;;
+      5)
+        ensure_nginx_interactive || continue
+        local sni=""
+        if ! sni="$(prompt_required "请输入要删除的 S-UI SNI 域名: ")"; then pause_return; continue; fi
+        if confirm_prompt "确认删除 S-UI SNI 路由 ${sni} 吗？"; then
+          run_menu_action cmd_route_remove --sni "$sni"
+        else
+          print_info "已取消删除 S-UI SNI 路由。"
+          pause_return
+        fi
+        ;;
+      6) return 0 ;;
+      *) print_warning "无效选项，请输入 1-6 之间的数字。" ;;
     esac
   done
 }
@@ -2836,10 +2991,11 @@ cmd_cert_menu() {
     print_menu_item 5 "查看证书列表"
     print_menu_item 6 "续期证书"
     print_menu_item 7 "删除证书"
-    print_menu_item 8 "返回上一级"
+    print_menu_item 8 "查找常见证书路径"
+    print_menu_item 9 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-8]: " c; then
+    if ! read -r -p "请选择操作 [1-9]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2906,8 +3062,9 @@ cmd_cert_menu() {
           pause_return
         fi
         ;;
-      8) return 0 ;;
-      *) print_warning "无效选项，请输入 1-8 之间的数字。" ;;
+      8) run_menu_action cmd_cert_find ;;
+      9) return 0 ;;
+      *) print_warning "无效选项，请输入 1-9 之间的数字。" ;;
     esac
   done
 }
@@ -3143,7 +3300,7 @@ cmd_backup_menu() {
         ;;
       5)
         local tag=""
-        tag="$(prompt_optional "请输入要确认取消的回滚 tag [默认 all]: " "all")"
+        tag="$(prompt_optional "请输入要确认取消的回滚 tag[默认 all]: " "all")"
         run_menu_action cancel_rollback "$tag"
         ;;
       6) return 0 ;;
@@ -3219,7 +3376,7 @@ show_main_menu() {
 cmd_menu() {
   while true; do
     show_main_menu
-    if ! read -r -p "请选择操作 [1-14]: " c; then
+    if ! read -r -p "请选择操作[1-14]: " c; then
       echo "已退出 VPS Gateway 管理面板。"
       exit 0
     fi
@@ -3292,6 +3449,7 @@ dispatch() {
     cert-status) cmd_cert_status "${ARGS[@]}" ;;
     cert-list) cmd_cert_list "${ARGS[@]}" ;;
     cert-remove) cmd_cert_remove "${ARGS[@]}" ;;
+    cert-find) cmd_cert_find "${ARGS[@]}" ;;
     firewall-check) cmd_firewall_check "${ARGS[@]}" ;;
     firewall-stage|firewall-only-443) cmd_firewall_stage "${ARGS[@]}" ;;
     firewall-confirm) cmd_firewall_confirm "${ARGS[@]}" ;;
