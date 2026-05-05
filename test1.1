@@ -1716,6 +1716,142 @@ cmd_uninstall() {
   warn "状态/配置目录已保留以便审计：$BASE_DIR"
 }
 
+cmd_ssh_import_key_menu() {
+  local user=""
+  read -r -p "请输入要导入公钥的 Linux 用户名: " user
+  user="${user//$'\r'/}"
+  if [[ -z "$user" ]]; then
+    print_error "用户名不能为空。"
+    pause_return
+    return 0
+  fi
+
+  while true; do
+    print_banner "导入 SSH 公钥"
+    print_menu_item 1 "从 GitHub 用户名导入"
+    print_menu_item 2 "从本地公钥文件导入"
+    print_menu_item 3 "直接粘贴 SSH 公钥"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择导入方式 [1-4]: " c; then
+      echo "已返回用户与 SSH 安全菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        local github=""
+        read -r -p "请输入 GitHub 用户名: " github
+        github="${github//$'\r'/}"
+        if [[ -z "$github" ]]; then
+          print_error "GitHub 用户名不能为空。"
+          pause_return
+          continue
+        fi
+        run_menu_action cmd_ssh_import_key --user "$user" --github "$github"
+        return 0
+        ;;
+      2)
+        local file=""
+        read -r -p "请输入本地公钥文件路径: " file
+        file="${file//$'\r'/}"
+        if [[ -z "$file" ]]; then
+          print_error "公钥文件路径不能为空。"
+          pause_return
+          continue
+        fi
+        run_menu_action cmd_ssh_import_key --user "$user" --file "$file"
+        return 0
+        ;;
+      3)
+        local key=""
+        read -r -p "请粘贴完整 SSH 公钥: " key
+        key="${key//$'\r'/}"
+        if [[ -z "$key" ]]; then
+          print_error "SSH 公钥不能为空。"
+          pause_return
+          continue
+        fi
+        run_menu_action cmd_ssh_import_key --user "$user" --key "$key"
+        return 0
+        ;;
+      4)
+        return 0
+        ;;
+      *)
+        print_warning "无效选项，请输入 1-4 之间的数字。"
+        ;;
+    esac
+  done
+}
+
+cmd_ssh_menu() {
+  while true; do
+    print_banner "用户与 SSH 安全"
+    print_menu_item 1 "创建 sudo 用户"
+    print_menu_item 2 "导入 SSH 公钥"
+    print_menu_item 3 "SSH 加固：禁用密码登录"
+    print_menu_item 4 "SSH 内网化：监听 127.0.0.1:端口"
+    print_menu_item 5 "检查 SSH 配置与监听端口"
+    print_menu_item 6 "返回主菜单"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-6]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        local name=""
+        read -r -p "请输入要创建的用户名: " name
+        name="${name//$'\r'/}"
+        if [[ -z "$name" ]]; then
+          print_error "用户名不能为空。"
+          pause_return
+          continue
+        fi
+        run_menu_action cmd_user_create --name "$name"
+        ;;
+      2)
+        cmd_ssh_import_key_menu
+        ;;
+      3)
+        print_warning "该操作会禁用 SSH 密码登录，只允许公钥登录。请确认已经至少导入一个可用 SSH 公钥，并保持当前 SSH 会话不要关闭。"
+        if confirm_prompt "确认继续执行 SSH 加固吗？"; then
+          run_menu_action cmd_ssh_harden
+        else
+          print_info "已取消 SSH 加固操作。"
+          pause_return
+        fi
+        ;;
+      4)
+        local port=""
+        read -r -p "请输入 OpenSSH 内部监听端口 [默认 2222]: " port
+        port="${port//$'\r'/}"
+        [[ -n "$port" ]] || port="2222"
+        if ! valid_port "$port"; then
+          print_error "端口无效，请输入 1..65535 之间的数字。"
+          pause_return
+          continue
+        fi
+        print_warning "该操作会让 OpenSSH 只监听 127.0.0.1:${port}。请保持当前 SSH 会话不要关闭，并确认你有控制台、VNC、IPMI 或云厂商救援方式。"
+        run_menu_action cmd_ssh_internalize --port "$port"
+        ;;
+      5)
+        run_menu_action cmd_ssh_check
+        ;;
+      6)
+        return 0
+        ;;
+      *)
+        print_warning "无效选项，请输入 1-6 之间的数字。"
+        ;;
+    esac
+  done
+}
+
 print_command_group() {
   local title="$1"; shift
   print_section "$title"
@@ -1752,12 +1888,7 @@ cmd_menu() {
     c="${c//$'\r'/}"
     case "$c" in
       1) run_menu_action cmd_doctor ;;
-      2) run_menu_action print_command_group "用户与 SSH 安全" \
-        "vps-gateway user-create --name 用户名" \
-        "vps-gateway ssh-import-key --user 用户名 --github GitHub用户名" \
-        "vps-gateway ssh-harden" \
-        "vps-gateway ssh-internalize --port 2222" \
-        "vps-gateway ssh-check" ;;
+      2) cmd_ssh_menu ;;
       3) run_menu_action print_command_group "Nginx TCP 443 网关" \
         "vps-gateway gateway-check" \
         "vps-gateway gateway-install" \
