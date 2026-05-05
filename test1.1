@@ -433,6 +433,9 @@ echo "[\$(date '+%F %T')] Auto rollback tag=${tag} module=${module}"
 EOF
   run chmod 700 "$script"
   if have systemd-run; then
+    run systemctl cancel "vps-gateway-rollback-${tag}.timer" 2>/dev/null || true
+    run systemctl reset-failed "vps-gateway-rollback-${tag}.service" 2>/dev/null || true
+    run systemctl reset-failed "vps-gateway-rollback-${tag}.timer" 2>/dev/null || true
     run systemd-run --unit="vps-gateway-rollback-${tag}" --on-active="$delay" /bin/bash "$script"
   else
     warn "未找到 systemd-run，无法安排自动回滚。"
@@ -457,7 +460,11 @@ EOF
     info "已取消回滚定时任务。"
     return 0
   fi
-  have systemctl && run systemctl cancel "vps-gateway-rollback-${tag}.timer" || true
+  if have systemctl; then
+    run systemctl cancel "vps-gateway-rollback-${tag}.timer" 2>/dev/null || true
+    run systemctl reset-failed "vps-gateway-rollback-${tag}.service" 2>/dev/null || true
+    run systemctl reset-failed "vps-gateway-rollback-${tag}.timer" 2>/dev/null || true
+  fi
   write_file "$BASE_DIR/state/rollback.json" <<'EOF'
 {}
 EOF
