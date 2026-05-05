@@ -1521,6 +1521,15 @@ EOF
 
 generate_inner_nginx_conf() {
   local sni="$1" inner_port="$2" backend="$3" type="$4" cert="$5" key="$6"
+  local backend_port="" proxy_host="\$host"
+  if [[ "$type" == "sui" ]]; then
+    backend_port="${backend##*:}"
+    if valid_port "$backend_port"; then
+      proxy_host="${sni}:${backend_port}"
+    else
+      proxy_host="${sni}"
+    fi
+  fi
   local access_log="off"
   [[ "$type" != "vaultwarden" ]] && access_log="/var/log/nginx/${sni}.access.log"
   write_file "$(inner_conf_path "$sni")" <<EOF
@@ -1541,7 +1550,8 @@ server {
     location / {
         proxy_pass http://${backend};
         proxy_http_version 1.1;
-        proxy_set_header Host \$host;
+        proxy_set_header Host ${proxy_host};
+        proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
