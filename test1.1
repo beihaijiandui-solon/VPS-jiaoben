@@ -506,7 +506,7 @@ lint_generated_nginx_conf() {
   local has_error=0
   for f in "${files[@]}"; do
     if grep -qE 'listen\[' "$f"; then
-      print_error "检测到疑似错误写法 listen[ 在文件 $f 中，应为 listen[。"
+      print_error "检测到疑似错误写法 listen[ 在文件 $f 中，应为 listen [。"
       has_error=1
     fi
     if grep -qE '(^|[[:space:]])(listen127|listen0\.|server_name[A-Za-z0-9]|proxy_passhttp|proxy_pass127|ssl_certificate/|ssl_certificate_key/)' "$f"; then
@@ -1520,7 +1520,7 @@ generate_inner_nginx_conf() {
 # Managed by vps-gateway.
 server {
     listen 127.0.0.1:${inner_port} ssl;
-    listen[::1]:${inner_port} ssl;
+    listen [::1]:${inner_port} ssl;
     http2 on;
     server_name ${sni};
 
@@ -2453,7 +2453,7 @@ install_nginx_org_repo() {
   run apt-get install -y curl gnupg ca-certificates lsb-release
   run mkdir -p /etc/apt/keyrings
   run sh -c "curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg"
-  run sh -c "printf 'deb[signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
+  run sh -c "printf 'deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
   run apt-get update
   run apt-get install -y nginx
 }
@@ -2922,7 +2922,7 @@ cmd_route_add_protocol_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作[1-4]: " c; then
+    if ! read -r -p "请选择操作 [1-4]: " c; then
       return 0
     fi
     c="${c//$'\r'/}"
@@ -3017,7 +3017,7 @@ cmd_vaultwarden_menu() {
     print_menu_item 6 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作[1-6]: " c; then
+    if ! read -r -p "请选择操作 [1-6]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -3079,7 +3079,7 @@ cmd_sui_menu() {
         ensure_nginx_interactive || continue
         local sni="" inner_port="" backend=""
         if ! sni="$(prompt_required "请输入 S-UI 访问域名 SNI: ")"; then pause_return; continue; fi
-        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口[默认 8445]: " "8445")"; then pause_return; continue; fi
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8445]: " "8445")"; then pause_return; continue; fi
         if ! backend="$(prompt_required "请输入 S-UI 后端地址，例如 127.0.0.1:2095: ")"; then pause_return; continue; fi
         prompt_cert_source_for_route "$sni" "sui" "$inner_port" "$backend"
         ;;
@@ -3237,7 +3237,7 @@ cmd_firewall_close_menu() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作[1-4]: " c; then
+    if ! read -r -p "请选择操作 [1-4]: " c; then
       return 0
     fi
     c="${c//$'\r'/}"
@@ -3280,7 +3280,7 @@ cmd_firewall_menu() {
     print_menu_item 7 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作[1-7]: " c; then
+    if ! read -r -p "请选择操作 [1-7]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -3469,11 +3469,11 @@ cmd_uninstall_menu() {
 cmd_self_lint() {
   echo "自检开始..."
   bash -n "$SELF_PATH" || die "bash -n 失败"
-  if grep -nE 'listen\[' "$SELF_PATH"; then die "检测到 listen[ 错误"; fi
-  if grep -nE '请选择操作\[' "$SELF_PATH"; then die "检测到 请选择操作[ 错误"; fi
-  if grep -nE '端口\[默认' "$SELF_PATH"; then die "检测到 端口[默认 错误"; fi
-  if grep -nE '地址\[默认' "$SELF_PATH"; then die "检测到 地址[默认 错误"; fi
-  if grep -nE 'tag\[默认' "$SELF_PATH"; then die "检测到 tag[默认 错误"; fi
+  if grep -nE '^[[:space:]]*listen\[' "$SELF_PATH"; then die "检测到 Nginx listen 与 IPv6 地址粘连错误"; fi
+  if grep -nE 'read -r -p "请选择操作\[' "$SELF_PATH"; then die "检测到菜单提示缺少空格"; fi
+  if grep -nE '监听端口\[默认' "$SELF_PATH"; then die "检测到端口默认值提示缺少空格"; fi
+  if grep -nE '后端地址\[默认' "$SELF_PATH"; then die "检测到地址默认值提示缺少空格"; fi
+  if grep -nE 'tag\[默认' "$SELF_PATH"; then die "检测到 tag 默认值提示缺少空格"; fi
   echo "自检通过 ✅"
 }
 
