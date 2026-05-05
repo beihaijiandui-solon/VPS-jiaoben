@@ -1,0 +1,1760 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+BASE_DIR="${VPS_GATEWAY_BASE:-/etc/vps-gateway}"
+LOG_DIR="${VPS_GATEWAY_LOG:-/var/log/vps-gateway}"
+NGINX_DIR="/etc/nginx"
+NGINX_STREAM_DIR="/etc/nginx/stream.d"
+NGINX_HTTP_DIR="/etc/nginx/conf.d"
+REALITY_CONF_DEFAULT="/etc/nginx/stream-conf.d/reality443.conf"
+SSH_DROPIN="/etc/ssh/sshd_config.d/99-vps-gateway.conf"
+
+DRY_RUN=0
+VERBOSE=0
+ASSUME_YES=0
+COMMAND=""
+ARGS=()
+
+umask 077
+
+on_error() {
+  local exit_code=$?
+  local line_no=${1:-unknown}
+  log "ERROR" "Command failed at line ${line_no}; exit=${exit_code}"
+  exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
+usage() {
+  cat <<'EOF'
+vps-gateway - modular VPS security and TCP 443 gateway toolbox
+
+Usage:
+  vps-gateway [global options] <command> [command options]
+  vps-gateway
+  vps-gateway menu
+
+Global options:
+  --dry-run       Print actions without changing the system
+  --verbose       Print commands before running them
+  --yes, -y       Skip ordinary prompts; dangerous operations still run guards
+  --help, -h      Show help
+
+Core commands:
+  init, doctor, report
+  install-deps [--minimal|--full]
+  user-create --name USER
+  ssh-import-key --user USER (--github NAME|--file PATH|--key "ssh-ed25519 ...")
+  ssh-harden
+  ssh-internalize --port PORT
+  ssh-check [--mark-443-verified]
+  ssh-rollback
+  gateway-install, gateway-enable, gateway-disable, gateway-check, gateway-rollback
+  reality-check [--file PATH]
+  reality-route-list [--file PATH]
+  reality-route-add --sni DOMAIN --backend 127.0.0.1:PORT [--file PATH]
+  reality-route-remove --sni DOMAIN [--file PATH]
+  reality-route-set-default --backend 127.0.0.1:PORT [--file PATH]
+  reality-menu
+  route-add --sni DOMAIN --inner-port PORT --backend HOST:PORT --type TYPE [--cert-domain DOMAIN|--cert PATH --key PATH]
+  route-remove --sni DOMAIN
+  route-list
+  route-check --sni DOMAIN
+  route-disable --sni DOMAIN
+  route-enable --sni DOMAIN
+  vaultwarden-detect, vaultwarden-secure, vaultwarden-route-add, vaultwarden-check, vaultwarden-admin-protect, vaultwarden-backup
+  sui-detect, sui-secure, sui-route-add, sui-check
+  cert-install-acme, cert-set-cloudflare, cert-issue --domain DOMAIN --email EMAIL
+  cert-import --domain DOMAIN --cert PATH --key PATH
+  cert-renew, cert-status, cert-list, cert-remove --domain DOMAIN
+  firewall-check, firewall-stage, firewall-confirm, firewall-rollback
+  firewall-open --port PORT --proto tcp|udp
+  firewall-close --port PORT --proto tcp|udp
+  firewall-only-443
+  fail2ban-install, fail2ban-config-ssh, fail2ban-status
+  login-notify-enable, login-notify-disable, login-notify-test
+  docker-check-exposure, docker-list-ports, docker-suggest-fix
+  backup, backup-list, rollback [--module MODULE], confirm [MODULE], rollback-status
+  uninstall [--keep-certs] [--restore-ssh] [--restore-nginx]
+
+Architecture reminder:
+  Public TCP 443 must be owned by Nginx stream. OpenSSH must not also listen on
+  public 0.0.0.0:443. Use OpenSSH on 127.0.0.1:2222 and let stream route
+  non-TLS traffic there.
+EOF
+}
+
+parse_global_args() {
+  while (($#)); do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      --verbose) VERBOSE=1; shift ;;
+      --yes|-y) ASSUME_YES=1; shift ;;
+      --help|-h|help) COMMAND="help"; shift; ARGS=("$@"); return ;;
+      *) COMMAND="$1"; shift; ARGS=("$@"); return ;;
+    esac
+  done
+  COMMAND="menu"
+  ARGS=()
+}
+
+log_file_for_level() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s/main.log' "$LOG_DIR"
+}
+
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" | tee -a "$(log_file_for_level)" >&2
+}
+
+info() { log "INFO" "$*"; }
+warn() { log "WARN" "$*"; }
+die() { log "ERROR" "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+run() {
+  if ((VERBOSE || DRY_RUN)); then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+  fi
+  if ((DRY_RUN)); then
+    return 0
+  fi
+  "$@"
+}
+
+confirm_prompt() {
+  local prompt="$1"
+  if ((ASSUME_YES)); then
+    return 0
+  fi
+  read -r -p "${prompt} [y/N] " reply
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+danger_ack() {
+  local phrase="$1"
+  local prompt="$2"
+  local input=""
+  echo "$prompt"
+  echo "Type exactly: ${phrase}"
+  read -r input
+  [[ "$input" == "$phrase" ]]
+}
+
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "This command must run as root or via sudo."
+}
+
+init_layout() {
+  run mkdir -p \
+    "$BASE_DIR/modules" "$BASE_DIR/routes.d" "$BASE_DIR/certs" "$BASE_DIR/secrets" \
+    "$BASE_DIR/backups/ssh" "$BASE_DIR/backups/nginx" "$BASE_DIR/backups/firewall" \
+    "$BASE_DIR/backups/routes" "$BASE_DIR/backups/certs" "$BASE_DIR/backups/systemd" \
+    "$BASE_DIR/backups/fail2ban" "$BASE_DIR/state" "$LOG_DIR"
+  run chmod 700 "$BASE_DIR/secrets"
+  run chmod 700 "$BASE_DIR/backups"
+  run touch "$BASE_DIR/config.env" "$BASE_DIR/state/routes.json" "$BASE_DIR/state/modules.json" \
+    "$BASE_DIR/state/rollback.json" "$BASE_DIR/state/last-check.json"
+  run chmod 600 "$BASE_DIR/config.env" "$BASE_DIR/state/"*.json
+}
+
+write_file() {
+  local path="$1"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  if ((DRY_RUN)); then
+    info "Would write ${path}"
+    rm -f "$tmp"
+    return 0
+  fi
+  install -m 600 "$tmp" "$path"
+  rm -f "$tmp"
+}
+
+set_module_state() {
+  local module="$1" state="$2" note="${3:-}"
+  local file="$BASE_DIR/modules/${module}.env"
+  write_file "$file" <<EOF
+MODULE=${module}
+STATE=${state}
+UPDATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+NOTE=${note}
+EOF
+}
+
+snapshot_module() {
+  local module="$1"
+  local dest="$BASE_DIR/backups/${module}/$(date '+%Y%m%d-%H%M%S')"
+  run mkdir -p "$dest"
+  case "$module" in
+    ssh)
+      [[ -d /etc/ssh ]] && run tar -C /etc -czf "$dest/ssh.tar.gz" ssh
+      [[ -d /etc/systemd/system/ssh.socket.d ]] && run tar -C /etc/systemd/system -czf "$dest/ssh-socket.d.tar.gz" ssh.socket.d
+      [[ -d /etc/systemd/system/ssh.service.d ]] && run tar -C /etc/systemd/system -czf "$dest/ssh-service.d.tar.gz" ssh.service.d
+      ;;
+    nginx)
+      [[ -d /etc/nginx ]] && run tar -C /etc -czf "$dest/nginx.tar.gz" nginx
+      ;;
+    firewall)
+      have ufw && run sh -c "ufw status verbose > '$dest/ufw-status.txt' || true"
+      [[ -d /etc/ufw ]] && run tar -C /etc -czf "$dest/ufw.tar.gz" ufw
+      have iptables-save && run sh -c "iptables-save > '$dest/iptables.v4' || true"
+      have ip6tables-save && run sh -c "ip6tables-save > '$dest/iptables.v6' || true"
+      ;;
+    routes)
+      [[ -d "$BASE_DIR/routes.d" ]] && run tar -C "$BASE_DIR" -czf "$dest/routes.d.tar.gz" routes.d state/routes.json
+      [[ -d "$NGINX_STREAM_DIR" ]] && run tar -C /etc/nginx -czf "$dest/stream.d.tar.gz" stream.d
+      [[ -d "$NGINX_HTTP_DIR" ]] && run tar -C /etc/nginx -czf "$dest/conf.d.tar.gz" conf.d
+      ;;
+    certs)
+      [[ -d "$BASE_DIR/certs" ]] && run tar -C "$BASE_DIR" -czf "$dest/certs.tar.gz" certs
+      ;;
+    fail2ban)
+      [[ -d /etc/fail2ban ]] && run tar -C /etc -czf "$dest/fail2ban.tar.gz" fail2ban
+      ;;
+    *)
+      run tar -C "$BASE_DIR" -czf "$dest/vps-gateway-state.tar.gz" state modules routes.d config.env
+      ;;
+  esac
+  info "Snapshot created: $dest"
+  printf '%s\n' "$dest"
+}
+
+latest_snapshot() {
+  local module="$1"
+  find "$BASE_DIR/backups/$module" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1
+}
+
+restore_module() {
+  local module="$1"
+  local snap="${2:-}"
+  [[ -n "$snap" ]] || snap="$(latest_snapshot "$module")"
+  [[ -n "$snap" && -d "$snap" ]] || die "No snapshot found for module: $module"
+  info "Restoring $module from $snap"
+  case "$module" in
+    ssh)
+      [[ -f "$snap/ssh.tar.gz" ]] && run tar -C /etc -xzf "$snap/ssh.tar.gz"
+      [[ -f "$snap/ssh-socket.d.tar.gz" ]] && run tar -C /etc/systemd/system -xzf "$snap/ssh-socket.d.tar.gz"
+      [[ -f "$snap/ssh-service.d.tar.gz" ]] && run tar -C /etc/systemd/system -xzf "$snap/ssh-service.d.tar.gz"
+      run systemctl daemon-reload
+      validate_sshd
+      reload_ssh
+      ;;
+    nginx)
+      [[ -f "$snap/nginx.tar.gz" ]] && run tar -C /etc -xzf "$snap/nginx.tar.gz"
+      validate_nginx
+      reload_nginx
+      ;;
+    firewall)
+      [[ -f "$snap/ufw.tar.gz" ]] && run tar -C /etc -xzf "$snap/ufw.tar.gz"
+      have ufw && run ufw reload || true
+      ;;
+    routes)
+      [[ -f "$snap/routes.d.tar.gz" ]] && run tar -C "$BASE_DIR" -xzf "$snap/routes.d.tar.gz"
+      [[ -f "$snap/stream.d.tar.gz" ]] && run tar -C /etc/nginx -xzf "$snap/stream.d.tar.gz"
+      [[ -f "$snap/conf.d.tar.gz" ]] && run tar -C /etc/nginx -xzf "$snap/conf.d.tar.gz"
+      validate_nginx
+      reload_nginx
+      ;;
+    certs)
+      [[ -f "$snap/certs.tar.gz" ]] && run tar -C "$BASE_DIR" -xzf "$snap/certs.tar.gz"
+      ;;
+    fail2ban)
+      [[ -f "$snap/fail2ban.tar.gz" ]] && run tar -C /etc -xzf "$snap/fail2ban.tar.gz"
+      have systemctl && run systemctl restart fail2ban || true
+      ;;
+    *)
+      die "Unknown rollback module: $module"
+      ;;
+  esac
+}
+
+schedule_rollback() {
+  local tag="$1" module="$2" delay="${3:-5m}" snap="$4"
+  local script="$BASE_DIR/state/rollback-${tag}.sh"
+  write_file "$script" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec >>"$LOG_DIR/rollback.log" 2>&1
+echo "[\$(date '+%F %T')] Auto rollback tag=${tag} module=${module}"
+"$SELF_PATH" rollback --module "$module" --snapshot "$snap"
+EOF
+  run chmod 700 "$script"
+  if have systemd-run; then
+    run systemd-run --unit="vps-gateway-rollback-${tag}" --on-active="$delay" /bin/bash "$script"
+  else
+    warn "systemd-run not found; auto rollback cannot be scheduled."
+  fi
+  write_file "$BASE_DIR/state/rollback.json" <<EOF
+{"tag":"$tag","module":"$module","snapshot":"$snap","delay":"$delay","created_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  warn "Auto rollback scheduled for ${module} in ${delay}. Run 'vps-gateway confirm ${tag}' after verification."
+}
+
+cancel_rollback() {
+  local tag="${1:-}"
+  if [[ -z "$tag" || "$tag" == "all" ]]; then
+    if have systemctl; then
+      systemctl list-units 'vps-gateway-rollback-*' --all --no-legend 2>/dev/null | awk '{print $1}' | while read -r unit; do
+        [[ -n "$unit" ]] && run systemctl cancel "$unit" || true
+      done
+    fi
+    write_file "$BASE_DIR/state/rollback.json" <<'EOF'
+{}
+EOF
+    info "Rollback timers cancelled."
+    return 0
+  fi
+  have systemctl && run systemctl cancel "vps-gateway-rollback-${tag}.timer" || true
+  write_file "$BASE_DIR/state/rollback.json" <<'EOF'
+{}
+EOF
+  info "Rollback timer cancelled for ${tag}."
+}
+
+validate_sshd() {
+  local sshd_bin
+  sshd_bin="$(command -v sshd || command -v /usr/sbin/sshd || true)"
+  [[ -n "$sshd_bin" ]] || die "sshd not found."
+  run "$sshd_bin" -t
+  if ((VERBOSE)); then
+    "$sshd_bin" -T | grep -Ei '^(port|listenaddress|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin|allowtcpforwarding|x11forwarding|allowagentforwarding|permittunnel) ' || true
+  fi
+}
+
+reload_ssh() {
+  validate_sshd
+  if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+    run systemctl reload ssh.service || run systemctl restart ssh.service
+  elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+    run systemctl reload sshd.service || run systemctl restart sshd.service
+  else
+    die "No ssh.service or sshd.service found."
+  fi
+}
+
+validate_nginx() {
+  have nginx || die "nginx not found."
+  run nginx -t
+}
+
+reload_nginx() {
+  validate_nginx
+  run systemctl reload nginx
+}
+
+cmd_init() {
+  require_root
+  init_layout
+  set_module_state core configured "layout initialized"
+  info "Initialized ${BASE_DIR} and ${LOG_DIR}."
+}
+
+public_ip() {
+  if have curl; then
+    curl -fsS --connect-timeout 2 https://api.ipify.org 2>/dev/null || true
+  fi
+}
+
+check_ports() {
+  if have ss; then
+    ss -lntup 2>/dev/null || ss -lntu 2>/dev/null || true
+  elif have netstat; then
+    netstat -lntup 2>/dev/null || true
+  fi
+}
+
+nginx_has_stream() {
+  nginx -V 2>&1 | grep -Eq -- '--with-stream|ngx_stream_module|stream=dynamic'
+}
+
+nginx_has_ssl_preread() {
+  nginx -V 2>&1 | grep -Eq -- '--with-stream_ssl_preread_module|ngx_stream_ssl_preread_module'
+}
+
+detect_cloud_ssh_dropins() {
+  find /etc/ssh/sshd_config.d -maxdepth 1 -type f -name '*.conf' 2>/dev/null | while read -r f; do
+    if [[ "$f" != "$SSH_DROPIN" ]] && grep -Eiq 'PasswordAuthentication|KbdInteractiveAuthentication|PermitRootLogin|Port|ListenAddress' "$f"; then
+      echo "$f"
+    fi
+  done
+}
+
+docker_public_ports() {
+  have docker || return 0
+  docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}' 2>/dev/null | grep -E '0\.0\.0\.0:|:::' || true
+}
+
+cmd_doctor() {
+  init_layout
+  local score=100
+  echo "VPS Gateway doctor - $(date)"
+  echo "Version: $VERSION"
+  echo
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    echo "OS: ${PRETTY_NAME:-unknown}"
+    [[ "${VERSION_ID:-}" == 24.04* && "${ID:-}" == "ubuntu" ]] || { echo "WARN: expected Ubuntu 24.04.x"; score=$((score-8)); }
+  else
+    echo "WARN: /etc/os-release not found"; score=$((score-8))
+  fi
+  echo "User: $(id -un 2>/dev/null || true), UID=${EUID:-$(id -u)}"
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "WARN: not running as root; checks are partial"; score=$((score-3)); }
+  echo "SSH_CONNECTION: ${SSH_CONNECTION:-not an SSH session}"
+  echo "SSH_CLIENT: ${SSH_CLIENT:-unknown}"
+  echo "IPv6 addresses:"
+  ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print "  "$2}' || true
+  echo "Public IPv4: $(public_ip)"
+  echo
+  echo "Listening ports:"
+  check_ports
+  echo
+  if have nginx; then
+    echo "Nginx: installed ($(nginx -v 2>&1))"
+    nginx_has_stream && echo "Nginx stream: yes" || { echo "Nginx stream: no/unknown"; score=$((score-10)); }
+    nginx_has_ssl_preread && echo "Nginx ssl_preread: yes" || { echo "Nginx ssl_preread: no/unknown"; score=$((score-10)); }
+  else
+    echo "Nginx: missing"; score=$((score-8))
+  fi
+  echo
+  echo "SSH effective config:"
+  if have sshd || [[ -x /usr/sbin/sshd ]]; then
+    /usr/sbin/sshd -T 2>/dev/null | grep -Ei '^(port|listenaddress|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin)' || true
+  else
+    echo "sshd not found"; score=$((score-10))
+  fi
+  local cloud_dropins
+  cloud_dropins="$(detect_cloud_ssh_dropins || true)"
+  if [[ -n "$cloud_dropins" ]]; then
+    echo "WARN: SSH drop-ins may override security settings:"
+    echo "$cloud_dropins" | sed 's/^/  /'
+    score=$((score-6))
+  fi
+  echo
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    echo "WARN: ssh.socket is active; port/listen behavior may be socket-driven."
+    score=$((score-4))
+  else
+    echo "ssh.socket: inactive or absent"
+  fi
+  echo
+  if have ufw; then
+    echo "UFW:"
+    ufw status verbose || true
+  else
+    echo "UFW: missing"; score=$((score-4))
+  fi
+  have nft && { echo "nftables:"; nft list ruleset 2>/dev/null | head -n 80 || true; }
+  have iptables && { echo "iptables INPUT summary:"; iptables -S INPUT 2>/dev/null || true; }
+  echo
+  if have docker; then
+    echo "Docker: installed"
+    local exposed
+    exposed="$(docker_public_ports || true)"
+    if [[ -n "$exposed" ]]; then
+      echo "WARN: public Docker port mappings detected:"
+      echo "$exposed" | sed 's/^/  /'
+      score=$((score-12))
+    else
+      echo "Docker public mappings: none detected"
+    fi
+  else
+    echo "Docker: not installed"
+  fi
+  echo
+  echo "Vaultwarden detection:"
+  detect_vaultwarden || true
+  echo "S-UI detection:"
+  detect_sui || true
+  echo
+  [[ "$score" -lt 0 ]] && score=0
+  echo "Security score: ${score}/100"
+  write_file "$BASE_DIR/state/last-check.json" <<EOF
+{"checked_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","score":$score}
+EOF
+}
+
+cmd_report() { cmd_doctor; }
+
+cmd_install_deps() {
+  require_root
+  init_layout
+  local mode="minimal"
+  while (($#)); do
+    case "$1" in
+      --minimal) mode="minimal"; shift ;;
+      --full) mode="full"; shift ;;
+      *) die "Unknown install-deps option: $1" ;;
+    esac
+  done
+  local pkgs=(ca-certificates curl gnupg lsb-release openssh-server nginx-full ufw)
+  if [[ "$mode" == "full" ]]; then
+    pkgs+=(fail2ban jq socat cron tar gzip dnsutils net-tools)
+  fi
+  run apt-get update
+  run apt-get install -y "${pkgs[@]}"
+  set_module_state deps configured "$mode"
+  warn "Dependencies installed. SSH, firewall, Nginx routes and services were not modified by this command."
+  cmd_doctor
+}
+
+cmd_user_create() {
+  require_root
+  init_layout
+  local name=""
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      *) die "Unknown user-create option: $1" ;;
+    esac
+  done
+  [[ "$name" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid username."
+  if id "$name" >/dev/null 2>&1; then
+    info "User exists: $name"
+  else
+    run useradd -m -G sudo -s /bin/bash "$name"
+    warn "Set a strong local console password for ${name}: passwd ${name}"
+  fi
+}
+
+ensure_user_ssh_dir() {
+  local user="$1"
+  local home
+  home="$(getent passwd "$user" | cut -d: -f6)"
+  [[ -n "$home" && -d "$home" ]] || die "Home directory not found for $user"
+  run mkdir -p "$home/.ssh"
+  run chmod 700 "$home/.ssh"
+  run touch "$home/.ssh/authorized_keys"
+  run chmod 600 "$home/.ssh/authorized_keys"
+  run chown -R "$user:$user" "$home/.ssh"
+  printf '%s/.ssh/authorized_keys\n' "$home"
+}
+
+append_key_unique() {
+  local auth="$1" key="$2"
+  grep -qxF "$key" "$auth" 2>/dev/null || run sh -c "printf '%s\n' '$key' >> '$auth'"
+}
+
+cmd_ssh_import_key() {
+  require_root
+  init_layout
+  local user="" github="" file="" key=""
+  while (($#)); do
+    case "$1" in
+      --user) user="$2"; shift 2 ;;
+      --github) github="$2"; shift 2 ;;
+      --file) file="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      *) die "Unknown ssh-import-key option: $1" ;;
+    esac
+  done
+  [[ -n "$user" ]] || die "--user is required"
+  id "$user" >/dev/null 2>&1 || die "User not found: $user"
+  local auth
+  auth="$(ensure_user_ssh_dir "$user")"
+  if [[ -n "$github" ]]; then
+    have curl || die "curl is required"
+    local keys
+    keys="$(curl -fsSL "https://github.com/${github}.keys")"
+    [[ -n "$keys" ]] || die "No GitHub public keys found."
+    while IFS= read -r line; do
+      [[ "$line" =~ ^ssh- ]] && append_key_unique "$auth" "$line"
+    done <<<"$keys"
+  elif [[ -n "$file" ]]; then
+    [[ -f "$file" ]] || die "Public key file not found: $file"
+    while IFS= read -r line; do
+      [[ "$line" =~ ^ssh- ]] && append_key_unique "$auth" "$line"
+    done <"$file"
+  elif [[ -n "$key" ]]; then
+    [[ "$key" =~ ^ssh- ]] || die "Invalid SSH public key."
+    append_key_unique "$auth" "$key"
+  else
+    die "Use --github, --file, or --key."
+  fi
+  run chown "$user:$user" "$auth"
+  info "SSH public key imported for $user."
+}
+
+authorized_key_count() {
+  find /root /home -maxdepth 3 -path '*/.ssh/authorized_keys' -type f 2>/dev/null \
+    -exec awk 'NF && $1 ~ /^ssh-/{c++} END{print c+0}' {} + | awk '{s+=$1} END{print s+0}'
+}
+
+write_ssh_dropin() {
+  local port="${1:-}" internal="${2:-0}"
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "# Managed by vps-gateway. Do not edit by hand."
+    [[ -n "$port" ]] && echo "Port $port"
+    if [[ "$internal" == "1" ]]; then
+      echo "ListenAddress 127.0.0.1"
+      echo "ListenAddress ::1"
+    fi
+    cat <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTunnel no
+EOF
+  } >"$tmp"
+  if ((DRY_RUN)); then
+    info "Would write $SSH_DROPIN"
+    cat "$tmp"
+    rm -f "$tmp"
+  else
+    install -m 600 "$tmp" "$SSH_DROPIN"
+    rm -f "$tmp"
+  fi
+}
+
+cmd_ssh_harden() {
+  require_root
+  init_layout
+  local count
+  count="$(authorized_key_count)"
+  [[ "$count" -gt 0 ]] || die "No authorized SSH public keys found. Import a key before disabling password login."
+  local dropins
+  dropins="$(detect_cloud_ssh_dropins || true)"
+  [[ -z "$dropins" ]] || warn "Other SSH drop-ins may override settings: $dropins"
+  local snap
+  snap="$(snapshot_module ssh)"
+  write_ssh_dropin "" 0
+  validate_sshd
+  schedule_rollback "ssh" "ssh" "5m" "$snap"
+  reload_ssh
+  set_module_state ssh configured "hardened"
+  /usr/sbin/sshd -T | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin|permitemptypasswords|x11forwarding|allowagentforwarding|permittunnel) ' || true
+}
+
+cmd_ssh_internalize() {
+  require_root
+  init_layout
+  local port=""
+  while (($#)); do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *) die "Unknown ssh-internalize option: $1" ;;
+    esac
+  done
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || die "--port must be 1..65535"
+  [[ "$(authorized_key_count)" -gt 0 ]] || die "No authorized SSH public keys found."
+  warn "This will make OpenSSH listen on 127.0.0.1:${port}; keep the current SSH session open."
+  warn "Do not close public 22 with firewall until SSH over 443 is verified."
+  if [[ -n "${SSH_CONNECTION:-}" ]] && ! danger_ack "I have console or rollback access" "High-risk SSH change. A systemd auto rollback will be scheduled, but you should have VNC/IPMI/rescue access."; then
+    die "Aborted."
+  fi
+  local snap
+  snap="$(snapshot_module ssh)"
+  write_ssh_dropin "$port" 1
+  validate_sshd
+  schedule_rollback "ssh" "ssh" "5m" "$snap"
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    warn "ssh.socket is active. Disabling socket activation so sshd_config ListenAddress/Port can take effect."
+    run systemctl disable --now ssh.socket
+  fi
+  run systemctl enable --now ssh.service
+  reload_ssh
+  set_module_state ssh configured "internalized:${port}"
+  /usr/sbin/sshd -T | grep -Ei '^(port|listenaddress|passwordauthentication|pubkeyauthentication)' || true
+}
+
+cmd_ssh_check() {
+  init_layout
+  local mark=0
+  while (($#)); do
+    case "$1" in
+      --mark-443-verified) mark=1; shift ;;
+      *) die "Unknown ssh-check option: $1" ;;
+    esac
+  done
+  validate_sshd
+  /usr/sbin/sshd -T | grep -Ei '^(port|listenaddress|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin|allowtcpforwarding|x11forwarding|allowagentforwarding|permittunnel) ' || true
+  check_ports | grep -E ':(22|2222|443)\b' || true
+  if ((mark)); then
+    write_file "$BASE_DIR/state/ssh443-verified.env" <<EOF
+SSH_OVER_443_VERIFIED=yes
+VERIFIED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+EOF
+    info "Marked SSH over 443 as manually verified."
+  fi
+}
+
+cmd_gateway_install() {
+  require_root
+  init_layout
+  have nginx || run apt-get install -y nginx-full
+  nginx_has_stream || die "Nginx stream module not detected. Install nginx-full or the stream dynamic module."
+  nginx_has_ssl_preread || die "Nginx ssl_preread module not detected."
+  if [[ -f "$REALITY_CONF_DEFAULT" ]] && grep -Eq 'listen[[:space:]].*443' "$REALITY_CONF_DEFAULT"; then
+    die "Existing Reality stream config already listens on 443: $REALITY_CONF_DEFAULT. Use reality-route-* commands instead of gateway-install, or disable/adopt the existing 443 listener manually."
+  fi
+  local snap
+  snap="$(snapshot_module nginx)"
+  run mkdir -p "$NGINX_STREAM_DIR"
+  ensure_nginx_stream_include
+  write_file "$NGINX_STREAM_DIR/00-global-map.conf" <<'EOF'
+# Managed by vps-gateway.
+map $ssl_preread_protocol $vgw_is_tls {
+    ""      0;
+    default 1;
+}
+
+map $ssl_preread_server_name $vgw_tls_backend {
+    include /etc/nginx/stream.d/20-sni-routes.conf;
+    default 127.0.0.1:8443;
+}
+
+map $vgw_is_tls $vgw_final_backend {
+    0       127.0.0.1:2222;
+    1       $vgw_tls_backend;
+}
+EOF
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
+# Managed by vps-gateway. Route lines look like:
+# example.com 127.0.0.1:8444;
+EOF
+  write_file "$NGINX_STREAM_DIR/10-ssh-backend.conf" <<'EOF'
+# Managed by vps-gateway. SSH backend is 127.0.0.1:2222.
+EOF
+  write_file "$NGINX_STREAM_DIR/90-gateway.conf" <<'EOF'
+# Managed by vps-gateway. Public TCP 443 gateway.
+server {
+    listen 0.0.0.0:443 reuseport;
+    listen [::]:443 reuseport;
+    ssl_preread on;
+    proxy_connect_timeout 10s;
+    proxy_timeout 12h;
+    proxy_pass $vgw_final_backend;
+}
+EOF
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  set_module_state nginx configured "stream gateway installed"
+}
+
+ensure_nginx_stream_include() {
+  local conf="$NGINX_DIR/nginx.conf"
+  [[ -f "$conf" ]] || die "$conf not found"
+  grep -q 'include /etc/nginx/stream.d/\*.conf;' "$conf" && return 0
+  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$conf"; then
+    warn "Existing stream block found without vps-gateway include. Please add: include /etc/nginx/stream.d/*.conf;"
+    die "Refusing to guess-edit an existing stream block."
+  fi
+  local snap
+  snap="$(snapshot_module nginx)"
+  if ((DRY_RUN)); then
+    info "Would append stream include block to $conf"
+  else
+    cp -a "$conf" "$conf.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    cat >>"$conf" <<'EOF'
+
+# Managed by vps-gateway.
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+EOF
+  fi
+  info "nginx.conf backup is in nginx snapshot: $snap"
+}
+
+cmd_gateway_enable() { require_root; cmd_gateway_install; }
+
+cmd_gateway_disable() {
+  require_root
+  init_layout
+  local snap
+  snap="$(snapshot_module nginx)"
+  [[ -f "$NGINX_STREAM_DIR/90-gateway.conf" ]] && run mv "$NGINX_STREAM_DIR/90-gateway.conf" "$NGINX_STREAM_DIR/90-gateway.conf.disabled"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  set_module_state nginx disabled "gateway disabled"
+}
+
+cmd_gateway_check() {
+  init_layout
+  have nginx || die "nginx not found"
+  nginx -V 2>&1 | tr ' ' '\n' | grep -E -- 'stream|ssl_preread' || true
+  validate_nginx
+  echo "Stream routes:"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] && cat "$NGINX_STREAM_DIR/20-sni-routes.conf" || true
+  check_ports | grep ':443' || true
+}
+
+reality_parse_file_arg() {
+  local file="$REALITY_CONF_DEFAULT"
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf '%s\n' "$file"
+}
+
+reality_backend_is_safe() {
+  local backend="$1"
+  [[ "$backend" =~ ^(127\.0\.0\.1|\[?::1\]?|localhost):[0-9]+$ ]] || return 1
+  [[ "$backend" != 0.0.0.0:* && "$backend" != "[::]:"* ]]
+}
+
+reality_require_conf() {
+  local file="$1"
+  [[ -f "$file" ]] || die "Reality stream config not found: $file"
+  grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$file" \
+    || die "Config does not look like the expected backend_reality map: $file"
+}
+
+cmd_reality_check() {
+  init_layout
+  local file
+  file="$(reality_parse_file_arg "$@")"
+  reality_require_conf "$file"
+  echo "Reality config: $file"
+  echo
+  echo "Current Reality SNI map:"
+  awk '
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; next}
+    inside && /^[[:space:]]*\}/ {inside=0}
+    inside && $1 !~ /^#/ && NF >= 2 {print}
+  ' "$file"
+  echo
+  if grep -q '\$ssl_preread_protocol' "$file"; then
+    echo "Protocol split: present"
+  else
+    warn "No ssl_preread_protocol split found. Plain SSH has no TLS SNI and will hit the map default backend."
+  fi
+  validate_nginx
+}
+
+cmd_reality_route_list() {
+  local file
+  file="$(reality_parse_file_arg "$@")"
+  reality_require_conf "$file"
+  awk '
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; next}
+    inside && /^[[:space:]]*\}/ {inside=0}
+    inside && $1 !~ /^#/ && NF >= 2 {gsub(/;/, "", $2); printf "%-36s %s\n", $1, $2}
+  ' "$file"
+}
+
+reality_rewrite_route() {
+  local file="$1" sni="$2" backend="$3" mode="$4"
+  local tmp
+  tmp="$(mktemp)"
+  set +e
+  awk -v sni="$sni" -v backend="$backend" -v mode="$mode" '
+    BEGIN {inside=0; changed=0; inserted=0}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; print; next}
+    inside && /^[[:space:]]*\}/ {
+      if (mode == "add" && !inserted) {
+        printf "    %-34s %s;\n", sni, backend
+        inserted=1; changed=1
+      }
+      inside=0; print; next
+    }
+    inside && $1 == sni {
+      if (mode == "remove") {changed=1; next}
+      printf "    %-34s %s;\n", sni, backend
+      changed=1; inserted=1
+      next
+    }
+    inside && mode == "add" && $1 == "default" && !inserted {
+      printf "    %-34s %s;\n", sni, backend
+      inserted=1; changed=1
+      print; next
+    }
+    {print}
+    END {
+      if (mode == "remove" && changed == 0) exit 3
+      if (mode == "add" && changed == 0) exit 4
+    }
+  ' "$file" >"$tmp"
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 3 ]]; then
+    rm -f "$tmp"
+    die "Reality route not found: $sni"
+  elif [[ "$rc" -ne 0 ]]; then
+    rm -f "$tmp"
+    die "Failed to rewrite Reality route map."
+  fi
+  if ((DRY_RUN)); then
+    info "Would update $file"
+    cat "$tmp"
+    rm -f "$tmp"
+  else
+    cp -a "$file" "$file.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    install -m 644 "$tmp" "$file"
+    rm -f "$tmp"
+  fi
+}
+
+reality_set_default_backend() {
+  local file="$1" backend="$2"
+  local tmp
+  tmp="$(mktemp)"
+  set +e
+  awk -v backend="$backend" '
+    BEGIN {inside=0; changed=0}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; print; next}
+    inside && /^[[:space:]]*\}/ {inside=0; print; next}
+    inside && $1 == "default" {
+      printf "    %-34s %s;\n", "default", backend
+      changed=1
+      next
+    }
+    {print}
+    END { if (changed == 0) exit 3 }
+  ' "$file" >"$tmp"
+  local rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f "$tmp"
+    die "Failed to update Reality default backend."
+  fi
+  if ((DRY_RUN)); then
+    info "Would update $file"
+    cat "$tmp"
+    rm -f "$tmp"
+  else
+    cp -a "$file" "$file.vps-gateway.bak.$(date '+%Y%m%d-%H%M%S')"
+    install -m 644 "$tmp" "$file"
+    rm -f "$tmp"
+  fi
+}
+
+cmd_reality_route_add() {
+  require_root
+  init_layout
+  local file="$REALITY_CONF_DEFAULT" sni="" backend=""
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      --sni) sni="$2"; shift 2 ;;
+      --backend) backend="$2"; shift 2 ;;
+      *) die "Unknown reality-route-add option: $1" ;;
+    esac
+  done
+  valid_sni "$sni" || die "Invalid --sni"
+  reality_backend_is_safe "$backend" || die "Reality backend must be loopback, for example 127.0.0.1:6443."
+  reality_require_conf "$file"
+  local snap
+  snap="$(snapshot_module nginx)"
+  reality_rewrite_route "$file" "$sni" "$backend" "add"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  info "Reality route set: $sni -> $backend"
+}
+
+cmd_reality_route_remove() {
+  require_root
+  init_layout
+  local file="$REALITY_CONF_DEFAULT" sni=""
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      --sni) sni="$2"; shift 2 ;;
+      *) die "Unknown reality-route-remove option: $1" ;;
+    esac
+  done
+  valid_sni "$sni" || die "Invalid --sni"
+  reality_require_conf "$file"
+  confirm_prompt "Remove Reality SNI route ${sni} from ${file}?" || die "Aborted."
+  local snap
+  snap="$(snapshot_module nginx)"
+  reality_rewrite_route "$file" "$sni" "" "remove"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  info "Reality route removed: $sni"
+}
+
+cmd_reality_route_set_default() {
+  require_root
+  init_layout
+  local file="$REALITY_CONF_DEFAULT" backend=""
+  while (($#)); do
+    case "$1" in
+      --file) file="$2"; shift 2 ;;
+      --backend) backend="$2"; shift 2 ;;
+      *) die "Unknown reality-route-set-default option: $1" ;;
+    esac
+  done
+  reality_backend_is_safe "$backend" || die "Default backend must be loopback."
+  reality_require_conf "$file"
+  local snap
+  snap="$(snapshot_module nginx)"
+  reality_set_default_backend "$file" "$backend"
+  validate_nginx
+  schedule_rollback "nginx" "nginx" "5m" "$snap"
+  reload_nginx
+  info "Reality default backend set to $backend"
+}
+
+cmd_reality_menu() {
+  local file="$REALITY_CONF_DEFAULT"
+  while true; do
+    cat <<EOF
+
+Reality SNI Route Management
+Config: ${file}
+1. Check Reality stream config
+2. List Reality SNI routes
+3. Add or update Reality SNI route
+4. Remove Reality SNI route
+5. Change default Reality backend
+6. Use another config file
+0. Back
+EOF
+    read -r -p "Select: " c
+    case "$c" in
+      1) cmd_reality_check --file "$file" ;;
+      2) cmd_reality_route_list --file "$file" ;;
+      3)
+        local sni="" backend=""
+        read -r -p "SNI domain: " sni
+        read -r -p "Backend, e.g. 127.0.0.1:6443: " backend
+        cmd_reality_route_add --file "$file" --sni "$sni" --backend "$backend"
+        ;;
+      4)
+        local sni=""
+        read -r -p "SNI domain to remove: " sni
+        cmd_reality_route_remove --file "$file" --sni "$sni"
+        ;;
+      5)
+        local backend=""
+        read -r -p "Default backend, e.g. 127.0.0.1:2443: " backend
+        cmd_reality_route_set_default --file "$file" --backend "$backend"
+        ;;
+      6)
+        read -r -p "Reality config path: " file
+        [[ -n "$file" ]] || file="$REALITY_CONF_DEFAULT"
+        ;;
+      0) return 0 ;;
+      *) echo "Invalid selection." ;;
+    esac
+  done
+}
+
+valid_sni() { [[ "$1" =~ ^(\*\.)?[A-Za-z0-9.-]+$ && "$1" == *.* ]]; }
+valid_port() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]; }
+backend_is_safe() {
+  local backend="$1"
+  [[ "$backend" =~ ^(127\.0\.0\.1|\[?::1\]?|localhost|[A-Za-z0-9_.-]+):[0-9]+$ ]] || return 1
+  [[ "$backend" != 0.0.0.0:* && "$backend" != "[::]:"* ]]
+}
+
+route_json_path() { printf '%s/routes.d/%s.json' "$BASE_DIR" "$1"; }
+inner_conf_path() { printf '%s/%s.inner.conf' "$NGINX_HTTP_DIR" "$1"; }
+
+route_line_exists() {
+  local sni="$1"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] && grep -Eq "^[[:space:]]*${sni//./\\.}[[:space:]]+" "$NGINX_STREAM_DIR/20-sni-routes.conf"
+}
+
+inner_port_conflict() {
+  local port="$1" sni="${2:-}"
+  grep -R "listen 127.0.0.1:${port} ssl" "$NGINX_HTTP_DIR" "$BASE_DIR/routes.d" 2>/dev/null | grep -v "$sni" || true
+}
+
+rebuild_routes_index() {
+  local out="$BASE_DIR/state/routes.json"
+  if have jq; then
+    jq -s '.' "$BASE_DIR"/routes.d/*.json >"$out" 2>/dev/null || echo '[]' >"$out"
+  else
+    {
+      echo "["
+      local first=1 f
+      for f in "$BASE_DIR"/routes.d/*.json; do
+        [[ -f "$f" ]] || continue
+        ((first)) || echo ","
+        first=0
+        cat "$f"
+      done
+      echo "]"
+    } >"$out"
+  fi
+  chmod 600 "$out" 2>/dev/null || true
+}
+
+write_route_state() {
+  local sni="$1" inner_port="$2" backend="$3" type="$4" cert="$5" key="$6" enabled="$7" status="$8"
+  write_file "$(route_json_path "$sni")" <<EOF
+{"sni":"$sni","inner_port":$inner_port,"backend":"$backend","type":"$type","cert":"$cert","key":"$key","enabled":$enabled,"status":"$status","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  rebuild_routes_index
+}
+
+generate_inner_nginx_conf() {
+  local sni="$1" inner_port="$2" backend="$3" type="$4" cert="$5" key="$6"
+  local access_log="off"
+  [[ "$type" != "vaultwarden" ]] && access_log="/var/log/nginx/${sni}.access.log"
+  write_file "$(inner_conf_path "$sni")" <<EOF
+# Managed by vps-gateway.
+server {
+    listen 127.0.0.1:${inner_port} ssl;
+    listen [::1]:${inner_port} ssl;
+    http2 on;
+    server_name ${sni};
+
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log ${access_log};
+    error_log /var/log/nginx/${sni}.error.log warn;
+
+    location / {
+        proxy_pass http://${backend};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+    }
+}
+EOF
+}
+
+add_stream_route_line() {
+  local sni="$1" inner_port="$2"
+  run mkdir -p "$NGINX_STREAM_DIR"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
+# Managed by vps-gateway.
+EOF
+  if route_line_exists "$sni"; then
+    run sed -i.bak -E "s|^[[:space:]]*${sni//./\\.}[[:space:]].*|    ${sni} 127.0.0.1:${inner_port};|" "$NGINX_STREAM_DIR/20-sni-routes.conf"
+  else
+    run sh -c "printf '    %s 127.0.0.1:%s;\n' '$sni' '$inner_port' >> '$NGINX_STREAM_DIR/20-sni-routes.conf'"
+  fi
+}
+
+remove_stream_route_line() {
+  local sni="$1"
+  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || return 0
+  run sed -i.bak -E "/^[[:space:]]*${sni//./\\.}[[:space:]]+/d" "$NGINX_STREAM_DIR/20-sni-routes.conf"
+}
+
+cmd_route_add() {
+  require_root
+  init_layout
+  local sni="" inner_port="" backend="" type="generic" cert_domain="" cert="" key=""
+  while (($#)); do
+    case "$1" in
+      --sni) sni="$2"; shift 2 ;;
+      --inner-port) inner_port="$2"; shift 2 ;;
+      --backend) backend="$2"; shift 2 ;;
+      --type) type="$2"; shift 2 ;;
+      --cert-domain) cert_domain="$2"; shift 2 ;;
+      --cert) cert="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      *) die "Unknown route-add option: $1" ;;
+    esac
+  done
+  valid_sni "$sni" || die "Invalid --sni"
+  valid_port "$inner_port" || die "Invalid --inner-port"
+  backend_is_safe "$backend" || die "Backend must be loopback/internal, never 0.0.0.0."
+  [[ -z "$(inner_port_conflict "$inner_port" "$sni")" ]] || die "Inner port conflict: $inner_port"
+  if [[ -z "$cert" && -z "$key" ]]; then
+    local d="${cert_domain:-$sni}"
+    cert="$BASE_DIR/certs/$d/fullchain.pem"
+    key="$BASE_DIR/certs/$d/privkey.pem"
+  fi
+  if [[ "$type" == "tcp-pass-through" ]]; then
+    cert=""
+    key=""
+  elif [[ ! -f "$cert" || ! -f "$key" ]]; then
+    warn "Certificate files are missing. Route state will be created as pending_cert and disabled."
+    write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "false" "pending_cert"
+    return 0
+  fi
+  local snap
+  snap="$(snapshot_module routes)"
+  if [[ "$type" == "tcp-pass-through" ]]; then
+    add_stream_route_line "$sni" "${backend##*:}"
+  else
+    generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
+    add_stream_route_line "$sni" "$inner_port"
+  fi
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+  write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "true" "enabled"
+  info "Route enabled: ${sni} -> 127.0.0.1:${inner_port} -> ${backend}"
+}
+
+cmd_route_remove() {
+  require_root
+  init_layout
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "Unknown route-remove option: $1" ;; esac; done
+  valid_sni "$sni" || die "Invalid --sni"
+  confirm_prompt "Remove route ${sni}?" || die "Aborted."
+  local snap
+  snap="$(snapshot_module routes)"
+  remove_stream_route_line "$sni"
+  [[ -f "$(inner_conf_path "$sni")" ]] && run rm -f "$(inner_conf_path "$sni")"
+  [[ -f "$(route_json_path "$sni")" ]] && run rm -f "$(route_json_path "$sni")"
+  rebuild_routes_index
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+}
+
+cmd_route_list() {
+  init_layout
+  rebuild_routes_index
+  cat "$BASE_DIR/state/routes.json"
+}
+
+cmd_route_disable() {
+  require_root
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "Unknown route-disable option: $1" ;; esac; done
+  valid_sni "$sni" || die "Invalid --sni"
+  local snap
+  snap="$(snapshot_module routes)"
+  remove_stream_route_line "$sni"
+  [[ -f "$(inner_conf_path "$sni")" ]] && run mv "$(inner_conf_path "$sni")" "$(inner_conf_path "$sni").disabled"
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+  info "Route disabled: $sni"
+}
+
+cmd_route_enable() {
+  require_root
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "Unknown route-enable option: $1" ;; esac; done
+  valid_sni "$sni" || die "Invalid --sni"
+  local json
+  json="$(route_json_path "$sni")"
+  [[ -f "$json" ]] || die "Route state not found: $sni"
+  local inner_port backend type cert key
+  if have jq; then
+    inner_port="$(jq -r .inner_port "$json")"; backend="$(jq -r .backend "$json")"; type="$(jq -r .type "$json")"; cert="$(jq -r .cert "$json")"; key="$(jq -r .key "$json")"
+  else
+    inner_port="$(grep -o '"inner_port":[0-9]*' "$json" | cut -d: -f2)"
+    backend="$(grep -o '"backend":"[^"]*' "$json" | cut -d\" -f4)"
+    type="$(grep -o '"type":"[^"]*' "$json" | cut -d\" -f4)"
+    cert="$(grep -o '"cert":"[^"]*' "$json" | cut -d\" -f4)"
+    key="$(grep -o '"key":"[^"]*' "$json" | cut -d\" -f4)"
+  fi
+  [[ "$type" == "tcp-pass-through" || ( -f "$cert" && -f "$key" ) ]] || die "Certificate missing for $sni"
+  local snap
+  snap="$(snapshot_module routes)"
+  [[ "$type" == "tcp-pass-through" ]] || generate_inner_nginx_conf "$sni" "$inner_port" "$backend" "$type" "$cert" "$key"
+  add_stream_route_line "$sni" "$inner_port"
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+  write_route_state "$sni" "$inner_port" "$backend" "$type" "$cert" "$key" "true" "enabled"
+}
+
+cmd_route_check() {
+  local sni=""
+  while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "Unknown route-check option: $1" ;; esac; done
+  valid_sni "$sni" || die "Invalid --sni"
+  [[ -f "$(route_json_path "$sni")" ]] && cat "$(route_json_path "$sni")" || warn "No state for $sni"
+  grep -R "$sni" "$NGINX_STREAM_DIR" "$NGINX_HTTP_DIR" 2>/dev/null || true
+  validate_nginx
+}
+
+detect_vaultwarden() {
+  if have docker; then
+    docker ps --format '{{.Names}} {{.Image}} {{.Ports}}' 2>/dev/null | grep -Ei 'vaultwarden|bitwardenrs' || true
+  fi
+  systemctl list-units --type=service --all 2>/dev/null | grep -Ei 'vaultwarden|bitwarden' || true
+  check_ports | grep -E ':(8000|3012)\b' || true
+}
+
+cmd_vaultwarden_detect() { detect_vaultwarden; }
+cmd_vaultwarden_check() { detect_vaultwarden; docker_public_ports | grep -Ei 'vaultwarden|bitwarden' || true; }
+cmd_vaultwarden_secure() {
+  warn "Vaultwarden is a password manager. This command only reports risks; it will not edit containers or data."
+  cmd_vaultwarden_check
+  warn "Recommended exposure: bind backend to 127.0.0.1:8000 or a Docker internal network, then route through Nginx 443."
+}
+cmd_vaultwarden_route_add() { cmd_route_add --type vaultwarden "$@"; }
+cmd_vaultwarden_admin_protect() {
+  cat <<'EOF'
+Vaultwarden /admin hardening options:
+  1. Prefer disabling ADMIN_TOKEN when not actively administering.
+  2. Restrict /admin by source IP in the inner Nginx server.
+  3. Add Basic Auth on /admin.
+  4. Bind admin access to localhost and use SSH tunnel.
+No automatic change is made because this may lock you out of maintenance.
+EOF
+}
+cmd_vaultwarden_backup() {
+  require_root
+  init_layout
+  local dest="$BASE_DIR/backups/vaultwarden/$(date '+%Y%m%d-%H%M%S')"
+  run mkdir -p "$dest"
+  warn "This generic backup does not delete data. Add your Docker volume or data path manually if auto-detect misses it."
+  have docker && docker inspect "$(docker ps -q --filter ancestor=vaultwarden/server 2>/dev/null)" >"$dest/docker-inspect.json" 2>/dev/null || true
+  info "Backup metadata created: $dest"
+}
+
+detect_sui() {
+  systemctl list-units --type=service --all 2>/dev/null | grep -Ei '(^|[^a-z])s-ui|sui' || true
+  ps -ef | grep -Ei 's-ui|sui' | grep -v grep || true
+  check_ports | grep -Ei 's-ui|sui|:[0-9]+' | head -n 30 || true
+}
+
+cmd_sui_detect() { detect_sui; }
+cmd_sui_check() { detect_sui; }
+cmd_sui_secure() {
+  warn "This command reports S-UI exposure only; it will not rewrite S-UI config automatically."
+  detect_sui
+  warn "If S-UI listens on 0.0.0.0, change it to 127.0.0.1 in S-UI's own config or panel, then add an SNI route."
+}
+cmd_sui_route_add() { cmd_route_add --type sui "$@"; }
+
+cmd_cert_install_acme() {
+  require_root
+  init_layout
+  have curl || run apt-get install -y curl socat cron
+  if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+    run sh -c 'curl -fsSL https://get.acme.sh | sh'
+  fi
+  set_module_state cert configured "acme.sh installed"
+}
+
+cmd_cert_set_cloudflare() {
+  require_root
+  init_layout
+  local token=""
+  read -rsp "Cloudflare DNS API token (not Global API Key): " token
+  echo
+  [[ -n "$token" ]] || die "Token cannot be empty."
+  write_file "$BASE_DIR/secrets/cloudflare.env" <<EOF
+CF_Token='$token'
+EOF
+  run chmod 600 "$BASE_DIR/secrets/cloudflare.env"
+  warn "Use a least-privilege token: DNS Edit for the specific Zone only."
+}
+
+cmd_cert_issue() {
+  require_root
+  init_layout
+  local domain="" email=""
+  while (($#)); do
+    case "$1" in
+      --domain) domain="$2"; shift 2 ;;
+      --email) email="$2"; shift 2 ;;
+      *) die "Unknown cert-issue option: $1" ;;
+    esac
+  done
+  valid_sni "$domain" || die "Invalid domain"
+  [[ -n "$email" ]] || die "--email is required"
+  [[ -f "$BASE_DIR/secrets/cloudflare.env" ]] || die "Run cert-set-cloudflare first."
+  cmd_cert_install_acme
+  # shellcheck disable=SC1090
+  . "$BASE_DIR/secrets/cloudflare.env"
+  export CF_Token
+  local cert_dir="$BASE_DIR/certs/$domain"
+  run mkdir -p "$cert_dir"
+  local snap
+  snap="$(snapshot_module certs)"
+  run /root/.acme.sh/acme.sh --register-account -m "$email" || true
+  run /root/.acme.sh/acme.sh --issue --dns dns_cf -d "$domain" --keylength ec-256
+  run /root/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+    --fullchain-file "$cert_dir/fullchain.pem" \
+    --key-file "$cert_dir/privkey.pem" \
+    --reloadcmd "systemctl reload nginx"
+  run chmod 600 "$cert_dir/privkey.pem"
+  write_file "$cert_dir/meta.json" <<EOF
+{"domain":"$domain","source":"acme.sh","key_type":"ec-256","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  validate_nginx || true
+  schedule_rollback "certs" "certs" "10m" "$snap"
+  have systemctl && systemctl reload nginx 2>/dev/null || true
+}
+
+cmd_cert_import() {
+  require_root
+  init_layout
+  local domain="" cert="" key=""
+  while (($#)); do
+    case "$1" in
+      --domain) domain="$2"; shift 2 ;;
+      --cert) cert="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      *) die "Unknown cert-import option: $1" ;;
+    esac
+  done
+  valid_sni "$domain" || die "Invalid domain"
+  [[ -f "$cert" && -f "$key" ]] || die "Certificate or key not found."
+  local dest="$BASE_DIR/certs/$domain"
+  local snap
+  snap="$(snapshot_module certs)"
+  run mkdir -p "$dest"
+  run install -m 600 "$cert" "$dest/fullchain.pem"
+  run install -m 600 "$key" "$dest/privkey.pem"
+  write_file "$dest/meta.json" <<EOF
+{"domain":"$domain","source":"import","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  schedule_rollback "certs" "certs" "10m" "$snap"
+}
+
+cmd_cert_list() { find "$BASE_DIR/certs" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; }
+cmd_cert_status() {
+  local d
+  for d in "$BASE_DIR"/certs/*; do
+    [[ -f "$d/fullchain.pem" ]] || continue
+    echo "== $(basename "$d") =="
+    openssl x509 -in "$d/fullchain.pem" -noout -subject -issuer -dates 2>/dev/null || true
+    stat -c 'privkey mode: %a %n' "$d/privkey.pem" 2>/dev/null || true
+  done
+}
+cmd_cert_renew() {
+  require_root
+  [[ -x /root/.acme.sh/acme.sh ]] || die "acme.sh not installed"
+  run /root/.acme.sh/acme.sh --cron --home /root/.acme.sh
+  have systemctl && run systemctl reload nginx || true
+}
+cmd_cert_remove() {
+  require_root
+  local domain=""
+  while (($#)); do case "$1" in --domain) domain="$2"; shift 2 ;; *) die "Unknown cert-remove option: $1" ;; esac; done
+  valid_sni "$domain" || die "Invalid domain"
+  grep -R "\"cert\":\"$BASE_DIR/certs/$domain/" "$BASE_DIR/routes.d" >/dev/null 2>&1 && die "Certificate is still referenced by a route."
+  confirm_prompt "Remove certificate files for $domain?" || die "Aborted."
+  snapshot_module certs >/dev/null
+  run rm -rf "$BASE_DIR/certs/$domain"
+}
+
+ssh443_verified() { [[ -f "$BASE_DIR/state/ssh443-verified.env" ]] && grep -q 'SSH_OVER_443_VERIFIED=yes' "$BASE_DIR/state/ssh443-verified.env"; }
+
+cmd_firewall_check() {
+  have ufw && ufw status verbose || warn "ufw not installed"
+  have nft && nft list ruleset 2>/dev/null | head -n 120 || true
+  echo "Docker public ports:"
+  docker_public_ports || true
+}
+
+cmd_firewall_stage() {
+  require_root
+  init_layout
+  have ufw || run apt-get install -y ufw
+  docker_public_ports >/tmp/vps-gateway-docker-exposure.$$ 2>/dev/null || true
+  if [[ -s /tmp/vps-gateway-docker-exposure.$$ ]]; then
+    warn "Docker public port mappings can bypass UFW. Review docker-check-exposure before strict firewall."
+    cat /tmp/vps-gateway-docker-exposure.$$
+  fi
+  rm -f /tmp/vps-gateway-docker-exposure.$$ || true
+  if ! ssh443_verified; then
+    warn "SSH over 443 has not been marked verified."
+    warn "Open a new terminal and verify: ssh -p 443 USER@IP"
+    danger_ack "I verified SSH over 443" "firewall-stage will allow only TCP 443 inbound and may close public 22." || die "Aborted."
+    cmd_ssh_check --mark-443-verified
+  fi
+  local snap
+  snap="$(snapshot_module firewall)"
+  schedule_rollback "firewall" "firewall" "5m" "$snap"
+  run ufw --force reset
+  run ufw default deny incoming
+  run ufw default allow outgoing
+  run ufw allow in 443/tcp comment "vps-gateway public entry"
+  run ufw --force enable
+  set_module_state firewall configured "only 443 staged"
+  warn "Cloud provider security groups must also allow only TCP 443 inbound."
+}
+
+cmd_firewall_confirm() { cancel_rollback firewall; info "Firewall confirmed."; }
+cmd_firewall_open() {
+  require_root
+  local port="" proto="tcp"
+  while (($#)); do case "$1" in --port) port="$2"; shift 2 ;; --proto) proto="$2"; shift 2 ;; *) die "Unknown firewall-open option: $1" ;; esac; done
+  valid_port "$port" || die "Invalid port"
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || die "Invalid proto"
+  run ufw allow in "${port}/${proto}" comment "vps-gateway manual open"
+}
+cmd_firewall_close() {
+  require_root
+  local port="" proto="tcp"
+  while (($#)); do case "$1" in --port) port="$2"; shift 2 ;; --proto) proto="$2"; shift 2 ;; *) die "Unknown firewall-close option: $1" ;; esac; done
+  valid_port "$port" || die "Invalid port"
+  [[ "$port" == "22" ]] && ssh443_verified || true
+  if [[ "$port" == "22" && ! ssh443_verified ]]; then
+    die "Refusing to close 22 before SSH over 443 is marked verified."
+  fi
+  run ufw deny in "${port}/${proto}"
+}
+cmd_firewall_only_443() { cmd_firewall_stage "$@"; }
+
+cmd_fail2ban_install() { require_root; run apt-get update; run apt-get install -y fail2ban; }
+cmd_fail2ban_config_ssh() {
+  require_root
+  init_layout
+  local port
+  port="$(/usr/sbin/sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+  [[ -n "$port" ]] || port=22
+  warn "If SSH is reached through Nginx stream, sshd may see source IP as 127.0.0.1; Fail2ban may not ban real attackers."
+  snapshot_module fail2ban >/dev/null
+  write_file /etc/fail2ban/jail.d/vps-gateway-sshd.local <<EOF
+[sshd]
+enabled = true
+port = ${port}
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+findtime = 300
+bantime = 600
+EOF
+  run systemctl enable --now fail2ban
+  run systemctl restart fail2ban
+}
+cmd_fail2ban_status() { fail2ban-client status sshd 2>/dev/null || fail2ban-client status 2>/dev/null || true; }
+
+cmd_login_notify_enable() {
+  require_root
+  init_layout
+  local webhook=""
+  read -rsp "Webhook URL: " webhook
+  echo
+  [[ -n "$webhook" ]] || die "Webhook cannot be empty."
+  write_file "$BASE_DIR/secrets/webhook.env" <<EOF
+WEBHOOK_URL='$webhook'
+EOF
+  run chmod 600 "$BASE_DIR/secrets/webhook.env"
+  write_file /usr/local/sbin/vps-gateway-login-notify <<'EOF'
+#!/usr/bin/env bash
+set -u
+[[ "${PAM_TYPE:-}" == "open_session" ]] || exit 0
+source /etc/vps-gateway/secrets/webhook.env 2>/dev/null || exit 0
+host="$(hostname 2>/dev/null || echo unknown)"
+msg="SSH login host=${host} user=${PAM_USER:-unknown} from=${PAM_RHOST:-unknown} tty=${PAM_TTY:-unknown}"
+/usr/bin/timeout 8 /usr/bin/curl -fsS --connect-timeout 3 --max-time 6 -H 'Content-Type: application/json' -d "{\"text\":\"${msg}\"}" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+exit 0
+EOF
+  run chmod 700 /usr/local/sbin/vps-gateway-login-notify
+  grep -q 'vps-gateway-login-notify' /etc/pam.d/sshd || run sh -c "printf '%s\n' 'session optional pam_exec.so seteuid /usr/local/sbin/vps-gateway-login-notify' >> /etc/pam.d/sshd"
+}
+cmd_login_notify_disable() {
+  require_root
+  run sed -i.bak '/vps-gateway-login-notify/d' /etc/pam.d/sshd
+}
+cmd_login_notify_test() {
+  PAM_TYPE=open_session PAM_USER="${USER:-root}" PAM_RHOST="test" PAM_TTY="test" /usr/local/sbin/vps-gateway-login-notify || true
+}
+
+cmd_docker_list_ports() {
+  have docker || die "docker not installed"
+  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
+}
+cmd_docker_check_exposure() {
+  have docker || die "docker not installed"
+  local exposed
+  exposed="$(docker_public_ports || true)"
+  if [[ -n "$exposed" ]]; then
+    warn "Public Docker port mappings detected. Docker DNAT may bypass UFW:"
+    echo "$exposed"
+    return 1
+  fi
+  info "No public Docker port mappings detected."
+}
+cmd_docker_suggest_fix() {
+  cat <<'EOF'
+Suggested Docker exposure fixes:
+  - Change "8000:80" to "127.0.0.1:8000:80" for Vaultwarden.
+  - Bind S-UI panel ports to 127.0.0.1 or a private Docker network.
+  - Back up docker-compose.yml before editing.
+  - Recreate containers only after confirming the new bind address.
+This command does not edit docker-compose.yml automatically.
+EOF
+}
+
+cmd_backup() {
+  require_root
+  init_layout
+  snapshot_module ssh >/dev/null
+  snapshot_module nginx >/dev/null
+  snapshot_module firewall >/dev/null
+  snapshot_module routes >/dev/null
+  snapshot_module certs >/dev/null
+  snapshot_module fail2ban >/dev/null
+  info "Backup completed."
+}
+cmd_backup_list() { find "$BASE_DIR/backups" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort; }
+cmd_rollback() {
+  require_root
+  local module="all" snapshot=""
+  while (($#)); do
+    case "$1" in
+      --module) module="$2"; shift 2 ;;
+      --snapshot) snapshot="$2"; shift 2 ;;
+      *) die "Unknown rollback option: $1" ;;
+    esac
+  done
+  if [[ "$module" == "all" ]]; then
+    for m in ssh nginx firewall routes certs fail2ban; do restore_module "$m" || true; done
+  else
+    restore_module "$module" "$snapshot"
+  fi
+}
+cmd_rollback_status() {
+  [[ -f "$BASE_DIR/state/rollback.json" ]] && cat "$BASE_DIR/state/rollback.json" || echo '{}'
+  have systemctl && systemctl list-timers 'vps-gateway-rollback-*' --all 2>/dev/null || true
+}
+
+cmd_uninstall() {
+  require_root
+  local keep_certs=0 restore_ssh=0 restore_nginx=0
+  while (($#)); do
+    case "$1" in
+      --keep-certs) keep_certs=1; shift ;;
+      --restore-ssh) restore_ssh=1; shift ;;
+      --restore-nginx) restore_nginx=1; shift ;;
+      *) die "Unknown uninstall option: $1" ;;
+    esac
+  done
+  warn "Uninstall never deletes Vaultwarden or S-UI data."
+  confirm_prompt "Proceed with vps-gateway uninstall?" || die "Aborted."
+  ((restore_ssh)) && restore_module ssh || true
+  ((restore_nginx)) && restore_module nginx || true
+  ((keep_certs)) || warn "Certificates will be kept unless you manually remove $BASE_DIR/certs."
+  run rm -f /usr/local/sbin/vps-gateway-login-notify
+  run sed -i.bak '/vps-gateway-login-notify/d' /etc/pam.d/sshd || true
+  warn "State/config directory left in place for audit: $BASE_DIR"
+}
+
+cmd_menu() {
+  while true; do
+    cat <<'EOF'
+
+VPS Gateway Management
+1. System self-check and security score
+2. User and SSH security
+3. Nginx TCP 443 gateway
+4. Reality SNI route management
+5. Add/remove inner Nginx SNI route
+6. Vaultwarden secure access
+7. S-UI secure access
+8. Certificate management
+9. Firewall management
+10. Fail2ban / login notification
+11. Docker exposure check
+12. Backup / rollback
+13. Uninstall / restore
+0. Exit
+EOF
+    read -r -p "Select: " c
+    case "$c" in
+      1) cmd_doctor ;;
+      2) echo "Commands: user-create, ssh-import-key, ssh-harden, ssh-internalize, ssh-check" ;;
+      3) echo "Commands: gateway-install, gateway-check, gateway-disable" ;;
+      4) cmd_reality_menu ;;
+      5) echo "Commands: route-add, route-remove, route-list, route-enable, route-disable, route-check" ;;
+      6) echo "Commands: vaultwarden-detect, vaultwarden-secure, vaultwarden-route-add, vaultwarden-admin-protect, vaultwarden-backup" ;;
+      7) echo "Commands: sui-detect, sui-secure, sui-route-add, sui-check" ;;
+      8) echo "Commands: cert-set-cloudflare, cert-issue, cert-import, cert-list, cert-status, cert-renew, cert-remove" ;;
+      9) echo "Commands: firewall-check, firewall-stage, firewall-confirm, firewall-open, firewall-close, firewall-only-443" ;;
+      10) echo "Commands: fail2ban-install, fail2ban-config-ssh, fail2ban-status, login-notify-enable, login-notify-disable, login-notify-test" ;;
+      11) cmd_docker_check_exposure || true ;;
+      12) echo "Commands: backup, backup-list, rollback, confirm, rollback-status" ;;
+      13) echo "Command: uninstall [--keep-certs] [--restore-ssh] [--restore-nginx]" ;;
+      0) exit 0 ;;
+      *) echo "Invalid selection." ;;
+    esac
+  done
+}
+
+dispatch() {
+  case "$COMMAND" in
+    help) usage ;;
+    menu) cmd_menu "${ARGS[@]}" ;;
+    init) cmd_init "${ARGS[@]}" ;;
+    doctor) cmd_doctor "${ARGS[@]}" ;;
+    report) cmd_report "${ARGS[@]}" ;;
+    install-deps) cmd_install_deps "${ARGS[@]}" ;;
+    user-create) cmd_user_create "${ARGS[@]}" ;;
+    ssh-import-key) cmd_ssh_import_key "${ARGS[@]}" ;;
+    ssh-harden) cmd_ssh_harden "${ARGS[@]}" ;;
+    ssh-internalize) cmd_ssh_internalize "${ARGS[@]}" ;;
+    ssh-check) cmd_ssh_check "${ARGS[@]}" ;;
+    ssh-rollback) cmd_rollback --module ssh ;;
+    gateway-install|gateway-enable) cmd_gateway_install "${ARGS[@]}" ;;
+    gateway-disable) cmd_gateway_disable "${ARGS[@]}" ;;
+    gateway-check) cmd_gateway_check "${ARGS[@]}" ;;
+    gateway-rollback) cmd_rollback --module nginx ;;
+    reality-check) cmd_reality_check "${ARGS[@]}" ;;
+    reality-route-list) cmd_reality_route_list "${ARGS[@]}" ;;
+    reality-route-add) cmd_reality_route_add "${ARGS[@]}" ;;
+    reality-route-remove) cmd_reality_route_remove "${ARGS[@]}" ;;
+    reality-route-set-default) cmd_reality_route_set_default "${ARGS[@]}" ;;
+    reality-menu) cmd_reality_menu "${ARGS[@]}" ;;
+    route-add) cmd_route_add "${ARGS[@]}" ;;
+    route-remove) cmd_route_remove "${ARGS[@]}" ;;
+    route-list) cmd_route_list "${ARGS[@]}" ;;
+    route-check) cmd_route_check "${ARGS[@]}" ;;
+    route-disable) cmd_route_disable "${ARGS[@]}" ;;
+    route-enable) cmd_route_enable "${ARGS[@]}" ;;
+    vaultwarden-detect) cmd_vaultwarden_detect "${ARGS[@]}" ;;
+    vaultwarden-secure) cmd_vaultwarden_secure "${ARGS[@]}" ;;
+    vaultwarden-route-add) cmd_vaultwarden_route_add "${ARGS[@]}" ;;
+    vaultwarden-check) cmd_vaultwarden_check "${ARGS[@]}" ;;
+    vaultwarden-admin-protect) cmd_vaultwarden_admin_protect "${ARGS[@]}" ;;
+    vaultwarden-backup) cmd_vaultwarden_backup "${ARGS[@]}" ;;
+    sui-detect) cmd_sui_detect "${ARGS[@]}" ;;
+    sui-secure) cmd_sui_secure "${ARGS[@]}" ;;
+    sui-route-add) cmd_sui_route_add "${ARGS[@]}" ;;
+    sui-check) cmd_sui_check "${ARGS[@]}" ;;
+    cert-install-acme) cmd_cert_install_acme "${ARGS[@]}" ;;
+    cert-set-cloudflare) cmd_cert_set_cloudflare "${ARGS[@]}" ;;
+    cert-issue) cmd_cert_issue "${ARGS[@]}" ;;
+    cert-import) cmd_cert_import "${ARGS[@]}" ;;
+    cert-renew) cmd_cert_renew "${ARGS[@]}" ;;
+    cert-status) cmd_cert_status "${ARGS[@]}" ;;
+    cert-list) cmd_cert_list "${ARGS[@]}" ;;
+    cert-remove) cmd_cert_remove "${ARGS[@]}" ;;
+    firewall-check) cmd_firewall_check "${ARGS[@]}" ;;
+    firewall-stage|firewall-only-443) cmd_firewall_stage "${ARGS[@]}" ;;
+    firewall-confirm) cmd_firewall_confirm "${ARGS[@]}" ;;
+    firewall-rollback) cmd_rollback --module firewall ;;
+    firewall-open) cmd_firewall_open "${ARGS[@]}" ;;
+    firewall-close) cmd_firewall_close "${ARGS[@]}" ;;
+    fail2ban-install) cmd_fail2ban_install "${ARGS[@]}" ;;
+    fail2ban-config-ssh) cmd_fail2ban_config_ssh "${ARGS[@]}" ;;
+    fail2ban-status) cmd_fail2ban_status "${ARGS[@]}" ;;
+    login-notify-enable) cmd_login_notify_enable "${ARGS[@]}" ;;
+    login-notify-disable) cmd_login_notify_disable "${ARGS[@]}" ;;
+    login-notify-test) cmd_login_notify_test "${ARGS[@]}" ;;
+    docker-check-exposure) cmd_docker_check_exposure "${ARGS[@]}" ;;
+    docker-list-ports) cmd_docker_list_ports "${ARGS[@]}" ;;
+    docker-suggest-fix) cmd_docker_suggest_fix "${ARGS[@]}" ;;
+    backup) cmd_backup "${ARGS[@]}" ;;
+    backup-list) cmd_backup_list "${ARGS[@]}" ;;
+    rollback) cmd_rollback "${ARGS[@]}" ;;
+    confirm) cancel_rollback "${ARGS[0]:-all}" ;;
+    rollback-status) cmd_rollback_status "${ARGS[@]}" ;;
+    uninstall) cmd_uninstall "${ARGS[@]}" ;;
+    *) usage; die "Unknown command: $COMMAND" ;;
+  esac
+}
+
+parse_global_args "$@"
+dispatch
