@@ -37,6 +37,7 @@ trap on_interrupt INT
 usage() {
   cat <<'EOF'
 VPS Gateway - 模块化 VPS 安全与 TCP 443 网关管理工具
+适配范围：Ubuntu 20.04 / 22.04 / 24.04 LTS
 
 用法：
   vps-gateway                         进入中文管理面板
@@ -120,6 +121,63 @@ die() { log "ERROR" "$*"; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+OS_ID="unknown"
+OS_VERSION_ID="unknown"
+OS_CODENAME=""
+OS_PRETTY_NAME="unknown"
+
+ubuntu_codename_from_version() {
+  case "${1:-}" in
+    20.04*) printf 'focal' ;;
+    22.04*) printf 'jammy' ;;
+    24.04*) printf 'noble' ;;
+    *) printf '' ;;
+  esac
+}
+
+detect_os() {
+  OS_ID="unknown"
+  OS_VERSION_ID="unknown"
+  OS_CODENAME=""
+  OS_PRETTY_NAME="unknown"
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION_ID="${VERSION_ID:-unknown}"
+    OS_CODENAME="${VERSION_CODENAME:-}"
+    OS_PRETTY_NAME="${PRETTY_NAME:-unknown}"
+  fi
+  if [[ -z "$OS_CODENAME" ]]; then
+    OS_CODENAME="$(ubuntu_codename_from_version "$OS_VERSION_ID")"
+  fi
+}
+
+ubuntu_version_id() {
+  detect_os
+  printf '%s' "$OS_VERSION_ID"
+}
+
+ubuntu_codename() {
+  detect_os
+  printf '%s' "$OS_CODENAME"
+}
+
+check_supported_ubuntu() {
+  detect_os
+  [[ "$OS_ID" == "ubuntu" ]] || return 1
+  case "$OS_VERSION_ID" in
+    20.04*|22.04*|24.04*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_supported_os_interactive() {
+  check_supported_ubuntu && return 0
+  print_warning "当前系统未明确支持：${OS_PRETTY_NAME}。本工具主要适配 Ubuntu 20.04 / 22.04 / 24.04，继续操作可能存在兼容性问题。"
+  confirm_prompt "仍要继续当前操作吗？"
+}
+
 color_enabled() {
   [[ -t 1 && -z "${NO_COLOR:-}" ]]
 }
@@ -184,7 +242,7 @@ pause_return() {
   read -r _
 }
 
-run_menu_action() {
+menu_try() {
   local rc=0
   set +e
   trap - ERR
@@ -195,6 +253,11 @@ run_menu_action() {
   if [[ "$rc" -ne 0 ]]; then
     print_error "当前操作执行失败，退出码：$rc。请根据上方提示处理后重试。"
   fi
+  return "$rc"
+}
+
+run_menu_action() {
+  menu_try "$@" || true
   pause_return
   return 0
 }
@@ -481,12 +544,16 @@ cmd_doctor() {
   echo "VPS Gateway 系统自检 - $(date)"
   echo "版本：$VERSION"
   echo
-  if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    echo "系统：${PRETTY_NAME:-unknown}"
-    [[ "${VERSION_ID:-}" == 24.04* && "${ID:-}" == "ubuntu" ]] || { echo "警告：期望系统为 Ubuntu 24.04.x"; score=$((score-8)); }
+  detect_os
+  echo "系统：${OS_PRETTY_NAME}"
+  echo "系统 ID：${OS_ID}"
+  echo "版本号：${OS_VERSION_ID}"
+  echo "Codename：${OS_CODENAME:-未知}"
+  if check_supported_ubuntu; then
+    echo "支持范围：是（Ubuntu 20.04 / 22.04 / 24.04）"
   else
-    echo "警告：未找到 /etc/os-release"; score=$((score-8))
+    echo "支持范围：未明确支持，可能存在兼容性问题"
+    score=$((score-8))
   fi
   echo "当前用户：$(id -un 2>/dev/null || true)，UID=${EUID:-$(id -u)}"
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "警告：当前不是 root，部分检查可能不完整"; score=$((score-3)); }
@@ -1592,7 +1659,10 @@ ssh443_verified() { [[ -f "$BASE_DIR/state/ssh443-verified.env" ]] && grep -q 'S
 
 cmd_firewall_check() {
   have ufw && ufw status verbose || warn "未安装 ufw"
+  have ufw && ufw status numbered || true
   have nft && nft list ruleset 2>/dev/null | head -n 120 || true
+  have iptables && { echo "iptables INPUT 摘要："; iptables -S INPUT 2>/dev/null || true; }
+  have ip6tables && { echo "ip6tables INPUT 摘要："; ip6tables -S INPUT 2>/dev/null || true; }
   echo "Docker 公网端口："
   docker_public_ports || true
 }
@@ -1610,7 +1680,7 @@ cmd_firewall_stage() {
   if ! ssh443_verified; then
     warn "尚未标记 SSH over 443 已验证。"
     warn "请打开一个新终端验证：ssh -p 443 USER@IP"
-    danger_ack "我已验证 SSH over 443" "firewall-stage 将只允许 TCP 443 入站，可能关闭公网 22。" || die "已取消。"
+    danger_ack "我已验证 SSH over 443" "firewall-stage 将只允许 TCP/UDP 443 入站，可能关闭公网 22。" || die "已取消。"
     cmd_ssh_check --mark-443-verified
   fi
   local snap
@@ -1619,10 +1689,12 @@ cmd_firewall_stage() {
   run ufw --force reset
   run ufw default deny incoming
   run ufw default allow outgoing
-  run ufw allow in 443/tcp comment "vps-gateway public entry"
+  run ufw allow in 443/tcp comment "vps-gateway public tcp entry"
+  run ufw allow in 443/udp comment "vps-gateway public udp entry"
   run ufw --force enable
-  set_module_state firewall configured "only 443 staged"
-  warn "云厂商安全组也需要同步设置为只允许 TCP 443 入站。"
+  set_module_state firewall configured "only tcp/udp 443 staged"
+  info "已允许 TCP 443 和 UDP 443 入站。"
+  warn "云厂商安全组也需要同步设置为只允许 TCP/UDP 443 入站。"
 }
 
 cmd_firewall_confirm() { cancel_rollback firewall; info "防火墙变更已确认。"; }
@@ -1632,6 +1704,7 @@ cmd_firewall_open() {
   while (($#)); do case "$1" in --port) port="$2"; shift 2 ;; --proto) proto="$2"; shift 2 ;; *) die "未知 firewall-open 参数：$1" ;; esac; done
   valid_port "$port" || die "端口格式无效"
   [[ "$proto" == "tcp" || "$proto" == "udp" ]] || die "协议格式无效"
+  have ufw || die "未安装 ufw"
   run ufw allow in "${port}/${proto}" comment "vps-gateway manual open"
 }
 cmd_firewall_close() {
@@ -1639,9 +1712,26 @@ cmd_firewall_close() {
   local port="" proto="tcp"
   while (($#)); do case "$1" in --port) port="$2"; shift 2 ;; --proto) proto="$2"; shift 2 ;; *) die "未知 firewall-close 参数：$1" ;; esac; done
   valid_port "$port" || die "端口格式无效"
-  [[ "$port" == "22" ]] && ssh443_verified || true
-  if [[ "$port" == "22" && ! ssh443_verified ]]; then
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || die "协议格式无效"
+  have ufw || die "未安装 ufw"
+  [[ "$port" == "22" && "$proto" == "tcp" ]] && ssh443_verified || true
+  if [[ "$port" == "22" && "$proto" == "tcp" && ! ssh443_verified ]]; then
     die "未标记 SSH over 443 验证成功，拒绝关闭 22。"
+  fi
+  local delete_rc=0
+  if ((DRY_RUN)); then
+    run ufw --force delete allow in "${port}/${proto}"
+  else
+    if ((VERBOSE)); then
+      printf '+ ufw --force delete allow in %q\n' "${port}/${proto}"
+    fi
+    set +e
+    ufw --force delete allow in "${port}/${proto}"
+    delete_rc=$?
+    set -e
+    if [[ "$delete_rc" -ne 0 ]]; then
+      warn "对应 allow 规则可能不存在，已继续添加 deny 规则。请用 ufw status numbered 手动确认。"
+    fi
   fi
   run ufw deny in "${port}/${proto}"
 }
@@ -2020,19 +2110,29 @@ install_nginx_org_repo() {
   local branch="$1"
   require_root
   local os_id="" codename="" repo_url=""
-  if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    os_id="${ID:-ubuntu}"
-    codename="${VERSION_CODENAME:-}"
-  fi
+  detect_os
+  os_id="$OS_ID"
+  codename="$OS_CODENAME"
   [[ -n "$codename" ]] || codename="$(lsb_release -cs 2>/dev/null || true)"
   [[ -n "$codename" ]] || { print_error "无法识别系统 codename。"; return 1; }
   case "$os_id" in
-    debian) repo_url="http://nginx.org/packages${branch}/debian" ;;
-    ubuntu|*) repo_url="http://nginx.org/packages${branch}/ubuntu" ;;
+    ubuntu)
+      case "$codename" in
+        focal|jammy|noble) ;;
+        *) print_error "nginx.org 官方源未在本脚本中确认支持当前 Ubuntu codename：$codename。请优先使用系统源 nginx-full 或自定义安装方式。"; return 1 ;;
+      esac
+      repo_url="http://nginx.org/packages${branch}/ubuntu"
+      ;;
+    debian)
+      repo_url="http://nginx.org/packages${branch}/debian"
+      ;;
+    *)
+      print_error "当前系统不是 Ubuntu/Debian，无法自动配置 nginx.org apt 源。"
+      return 1
+      ;;
   esac
   run apt-get update
-  run apt-get install -y curl gnupg2 ca-certificates lsb-release
+  run apt-get install -y curl gnupg ca-certificates lsb-release
   run mkdir -p /etc/apt/keyrings
   run sh -c "curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg"
   run sh -c "printf 'deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
@@ -2060,10 +2160,12 @@ cmd_nginx_dependency_menu() {
       1) run_menu_action install_package_apt nginx-full ;;
       2)
         print_warning "该操作会添加 nginx.org 官方 stable apt 源。"
+        ensure_supported_os_interactive || continue
         if confirm_prompt "确认继续吗？"; then run_menu_action install_nginx_org_repo ""; fi
         ;;
       3)
         print_warning "mainline 是更新分支，适合需要最新功能的用户。该操作会添加 nginx.org 官方 mainline apt 源。"
+        ensure_supported_os_interactive || continue
         if confirm_prompt "确认继续吗？"; then run_menu_action install_nginx_org_repo "/mainline"; fi
         ;;
       4)
@@ -2112,7 +2214,7 @@ cmd_nginx_stream_dependency_menu() {
     case "$c" in
       1) if confirm_prompt "确认安装 nginx-full 吗？"; then run_menu_action install_package_apt nginx-full; fi ;;
       2) if confirm_prompt "确认尝试安装 libnginx-mod-stream 吗？"; then run_menu_action install_package_apt libnginx-mod-stream; fi ;;
-      3) if confirm_prompt "确认使用 Nginx 官方 stable 源重新安装 nginx 吗？"; then run_menu_action install_nginx_org_repo ""; fi ;;
+      3) ensure_supported_os_interactive || continue; if confirm_prompt "确认使用 Nginx 官方 stable 源重新安装 nginx 吗？"; then run_menu_action install_nginx_org_repo ""; fi ;;
       4) return 1 ;;
       *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
     esac
@@ -2537,11 +2639,91 @@ cmd_cert_menu() {
   done
 }
 
+cmd_firewall_open_menu() {
+  while true; do
+    print_banner "手动开放端口"
+    print_menu_item 1 "只开放 TCP 端口"
+    print_menu_item 2 "只开放 UDP 端口"
+    print_menu_item 3 "同时开放 TCP 和 UDP 端口"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        ensure_ufw_interactive || continue
+        local port=""
+        if ! port="$(prompt_port "请输入要开放的 TCP 端口: " "")"; then pause_return; continue; fi
+        run_menu_action cmd_firewall_open --port "$port" --proto tcp
+        ;;
+      2)
+        ensure_ufw_interactive || continue
+        local port=""
+        if ! port="$(prompt_port "请输入要开放的 UDP 端口: " "")"; then pause_return; continue; fi
+        run_menu_action cmd_firewall_open --port "$port" --proto udp
+        ;;
+      3)
+        ensure_ufw_interactive || continue
+        local port=""
+        if ! port="$(prompt_port "请输入要同时开放 TCP 和 UDP 的端口: " "")"; then pause_return; continue; fi
+        menu_try cmd_firewall_open --port "$port" --proto tcp || true
+        menu_try cmd_firewall_open --port "$port" --proto udp || true
+        pause_return
+        ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_firewall_close_menu() {
+  while true; do
+    print_banner "手动关闭端口"
+    print_menu_item 1 "只关闭 TCP 端口"
+    print_menu_item 2 "只关闭 UDP 端口"
+    print_menu_item 3 "同时关闭 TCP 和 UDP 端口"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        ensure_ufw_interactive || continue
+        local port=""
+        if ! port="$(prompt_port "请输入要关闭的 TCP 端口: " "")"; then pause_return; continue; fi
+        run_menu_action cmd_firewall_close --port "$port" --proto tcp
+        ;;
+      2)
+        ensure_ufw_interactive || continue
+        local port=""
+        if ! port="$(prompt_port "请输入要关闭的 UDP 端口: " "")"; then pause_return; continue; fi
+        run_menu_action cmd_firewall_close --port "$port" --proto udp
+        ;;
+      3)
+        ensure_ufw_interactive || continue
+        local port=""
+        if ! port="$(prompt_port "请输入要同时关闭 TCP 和 UDP 的端口: " "")"; then pause_return; continue; fi
+        menu_try cmd_firewall_close --port "$port" --proto tcp || true
+        menu_try cmd_firewall_close --port "$port" --proto udp || true
+        pause_return
+        ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
 cmd_firewall_menu() {
   while true; do
     print_banner "防火墙管理"
     print_menu_item 1 "查看防火墙状态"
-    print_menu_item 2 "分阶段收紧：只允许 TCP 443 入站"
+    print_menu_item 2 "分阶段收紧：只允许 TCP/UDP 443 入站"
     print_menu_item 3 "确认防火墙变更"
     print_menu_item 4 "回滚防火墙变更"
     print_menu_item 5 "手动开放端口"
@@ -2558,7 +2740,7 @@ cmd_firewall_menu() {
       1) run_menu_action cmd_firewall_check ;;
       2)
         ensure_ufw_interactive || continue
-        print_warning "高危操作：将分阶段收紧防火墙，只允许 TCP 443 入站。请先确认 SSH over 443 可用。"
+        print_warning "高危操作：将分阶段收紧防火墙，只允许 TCP/UDP 443 入站。请先确认 SSH over 443 可用。"
         if confirm_prompt "确认继续执行防火墙收紧吗？"; then
           run_menu_action cmd_firewall_stage
         else
@@ -2576,18 +2758,10 @@ cmd_firewall_menu() {
         fi
         ;;
       5)
-        ensure_ufw_interactive || continue
-        local port="" proto=""
-        if ! port="$(prompt_port "请输入要开放的端口: " "")"; then pause_return; continue; fi
-        if ! proto="$(prompt_proto)"; then pause_return; continue; fi
-        run_menu_action cmd_firewall_open --port "$port" --proto "$proto"
+        cmd_firewall_open_menu
         ;;
       6)
-        ensure_ufw_interactive || continue
-        local port="" proto=""
-        if ! port="$(prompt_port "请输入要关闭的端口: " "")"; then pause_return; continue; fi
-        if ! proto="$(prompt_proto)"; then pause_return; continue; fi
-        run_menu_action cmd_firewall_close --port "$port" --proto "$proto"
+        cmd_firewall_close_menu
         ;;
       7) return 0 ;;
       *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
