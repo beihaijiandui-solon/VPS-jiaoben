@@ -1519,7 +1519,7 @@ EOF
 
 generate_inner_nginx_conf() {
   local sni="$1" inner_port="$2" backend="$3" type="$4" cert="$5" key="$6"
-local proxy_host="\$host"
+  local proxy_host="\$host"
   local access_log="off"
   [[ "$type" != "vaultwarden" ]] && access_log="/var/log/nginx/${sni}.access.log"
   write_file "$(inner_conf_path "$sni")" <<EOF
@@ -1557,6 +1557,14 @@ EOF
 
 add_stream_route_line() {
   local sni="$1" inner_port="$2"
+
+  if [[ -f "$REALITY_CONF_DEFAULT" ]] \
+    && grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$REALITY_CONF_DEFAULT" \
+    && grep -Eq 'listen[[:space:]].*443' "$REALITY_CONF_DEFAULT"; then
+    reality_rewrite_route "$REALITY_CONF_DEFAULT" "$sni" "127.0.0.1:${inner_port}" "add"
+    return 0
+  fi
+
   run mkdir -p "$NGINX_STREAM_DIR"
   [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
 # Managed by vps-gateway.
@@ -1570,6 +1578,14 @@ EOF
 
 add_stream_route_backend_line() {
   local sni="$1" backend="$2"
+
+  if [[ -f "$REALITY_CONF_DEFAULT" ]] \
+    && grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$REALITY_CONF_DEFAULT" \
+    && grep -Eq 'listen[[:space:]].*443' "$REALITY_CONF_DEFAULT"; then
+    reality_rewrite_route "$REALITY_CONF_DEFAULT" "$sni" "$backend" "add"
+    return 0
+  fi
+
   run mkdir -p "$NGINX_STREAM_DIR"
   [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
 # Managed by vps-gateway.
@@ -1583,6 +1599,14 @@ EOF
 
 remove_stream_route_line() {
   local sni="$1"
+
+  if [[ -f "$REALITY_CONF_DEFAULT" ]] \
+    && grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$REALITY_CONF_DEFAULT" \
+    && grep -Eq "^[[:space:]]*${sni//./\\.}[[:space:]]+" "$REALITY_CONF_DEFAULT"; then
+    reality_rewrite_route "$REALITY_CONF_DEFAULT" "$sni" "" "remove"
+    return 0
+  fi
+
   [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || return 0
   run sed -i.bak -E "/^[[:space:]]*${sni//./\\.}[[:space:]]+/d" "$NGINX_STREAM_DIR/20-sni-routes.conf"
 }
