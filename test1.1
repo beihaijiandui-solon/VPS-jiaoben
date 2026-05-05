@@ -844,9 +844,24 @@ EOF
 cmd_gateway_install() {
   require_root
   init_layout
+  local proto="tcp" udp_backend=""
+  while (($#)); do
+    case "$1" in
+      --proto) proto="$2"; shift 2 ;;
+      --udp-backend) udp_backend="$2"; shift 2 ;;
+      *) die "未知 gateway-install 参数：$1" ;;
+    esac
+  done
+  [[ "$proto" == "tcp" || "$proto" == "udp" || "$proto" == "both" ]] || die "--proto 只能是 tcp、udp 或 both"
+  if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+    [[ -n "$udp_backend" ]] || die "UDP 模式必须提供 --udp-backend"
+    backend_is_safe "$udp_backend" || die "UDP 后端必须是安全的本机/内部地址，不能是 0.0.0.0。"
+  fi
   have nginx || run apt-get install -y nginx-full
   nginx_has_stream || die "未检测到 Nginx stream 模块。请安装 nginx-full 或对应动态模块。"
-  nginx_has_ssl_preread || die "未检测到 Nginx ssl_preread 模块。"
+  if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+    nginx_has_ssl_preread || die "未检测到 Nginx ssl_preread 模块。"
+  fi
   if [[ -f "$REALITY_CONF_DEFAULT" ]] && grep -Eq 'listen[[:space:]].*443' "$REALITY_CONF_DEFAULT"; then
     die "检测到现有 Reality stream 配置已监听 443：$REALITY_CONF_DEFAULT。请使用 reality-route-* 命令管理路由，不要执行 gateway-install 抢占 443。"
   fi
@@ -854,7 +869,8 @@ cmd_gateway_install() {
   snap="$(snapshot_module nginx)"
   run mkdir -p "$NGINX_STREAM_DIR"
   ensure_nginx_stream_include
-  write_file "$NGINX_STREAM_DIR/00-global-map.conf" <<'EOF'
+  if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+    write_file "$NGINX_STREAM_DIR/00-global-map.conf" <<'EOF'
 # Managed by vps-gateway.
 map $ssl_preread_protocol $vgw_is_tls {
     ""      0;
@@ -871,14 +887,14 @@ map $vgw_is_tls $vgw_final_backend {
     1       $vgw_tls_backend;
 }
 EOF
-  [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
+    [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] || write_file "$NGINX_STREAM_DIR/20-sni-routes.conf" <<'EOF'
 # Managed by vps-gateway. Route lines look like:
 # example.com 127.0.0.1:8444;
 EOF
-  write_file "$NGINX_STREAM_DIR/10-ssh-backend.conf" <<'EOF'
+    write_file "$NGINX_STREAM_DIR/10-ssh-backend.conf" <<'EOF'
 # Managed by vps-gateway. SSH backend is 127.0.0.1:2222.
 EOF
-  write_file "$NGINX_STREAM_DIR/90-gateway.conf" <<'EOF'
+    write_file "$NGINX_STREAM_DIR/90-gateway.conf" <<'EOF'
 # Managed by vps-gateway. Public TCP 443 gateway.
 server {
     listen 0.0.0.0:443 reuseport;
@@ -889,10 +905,35 @@ server {
     proxy_pass $vgw_final_backend;
 }
 EOF
+  else
+    disable_nginx_conf_if_present "$NGINX_STREAM_DIR/90-gateway.conf"
+  fi
+  if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+    write_file "$NGINX_STREAM_DIR/91-gateway-udp.conf" <<EOF
+# Managed by vps-gateway. Public UDP 443 gateway.
+server {
+    listen 0.0.0.0:443 udp reuseport;
+    listen [::]:443 udp reuseport;
+    proxy_timeout 12h;
+    proxy_responses 0;
+    proxy_pass ${udp_backend};
+}
+EOF
+  else
+    disable_nginx_conf_if_present "$NGINX_STREAM_DIR/91-gateway-udp.conf"
+  fi
   validate_nginx
   schedule_rollback "nginx" "nginx" "5m" "$snap"
   reload_nginx
-  set_module_state nginx configured "stream gateway installed"
+  set_module_state nginx configured "stream gateway installed:${proto}"
+}
+
+disable_nginx_conf_if_present() {
+  local file="$1" target=""
+  [[ -f "$file" ]] || { info "未发现对应配置，已跳过：$file"; return 0; }
+  target="${file}.disabled.$(date '+%Y%m%d-%H%M%S')"
+  run mv "$file" "$target"
+  info "已禁用配置：$file -> $target"
 }
 
 ensure_nginx_stream_include() {
@@ -927,7 +968,9 @@ cmd_gateway_disable() {
   init_layout
   local snap
   snap="$(snapshot_module nginx)"
-  [[ -f "$NGINX_STREAM_DIR/90-gateway.conf" ]] && run mv "$NGINX_STREAM_DIR/90-gateway.conf" "$NGINX_STREAM_DIR/90-gateway.conf.disabled"
+  disable_nginx_conf_if_present "$NGINX_STREAM_DIR/90-gateway.conf"
+  disable_nginx_conf_if_present "$NGINX_STREAM_DIR/90-gateway-tcp.conf"
+  disable_nginx_conf_if_present "$NGINX_STREAM_DIR/91-gateway-udp.conf"
   validate_nginx
   schedule_rollback "nginx" "nginx" "5m" "$snap"
   reload_nginx
@@ -941,7 +984,20 @@ cmd_gateway_check() {
   validate_nginx
   echo "Stream 路由："
   [[ -f "$NGINX_STREAM_DIR/20-sni-routes.conf" ]] && cat "$NGINX_STREAM_DIR/20-sni-routes.conf" || true
-  check_ports | grep ':443' || true
+  echo
+  echo "TCP 443 监听："
+  if have ss; then
+    ss -lntup 2>/dev/null | grep -E '(:443)\b' || echo "TCP 443：未监听"
+  else
+    check_ports | grep -E '(:443)\b' || echo "TCP 443：未监听"
+  fi
+  echo
+  echo "UDP 443 监听："
+  if have ss; then
+    ss -lnuap 2>/dev/null | grep -E '(:443)\b' || echo "UDP 443：未监听"
+  else
+    echo "UDP 443：无法检测，缺少 ss"
+  fi
 }
 
 reality_parse_file_arg() {
@@ -1273,6 +1329,12 @@ backend_is_safe() {
 
 route_json_path() { printf '%s/routes.d/%s.json' "$BASE_DIR" "$1"; }
 inner_conf_path() { printf '%s/%s.inner.conf' "$NGINX_HTTP_DIR" "$1"; }
+udp_route_conf_path() { printf '%s/udp-%s.conf' "$NGINX_STREAM_DIR" "$1"; }
+
+safe_route_name() {
+  local name="$1"
+  printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_'
+}
 
 route_line_exists() {
   local sni="$1"
@@ -1310,6 +1372,53 @@ write_route_state() {
 {"sni":"$sni","inner_port":$inner_port,"backend":"$backend","type":"$type","cert":"$cert","key":"$key","enabled":$enabled,"status":"$status","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
 EOF
   rebuild_routes_index
+}
+
+write_udp_route_state() {
+  local name="$1" listen_port="$2" backend="$3"
+  write_file "$(route_json_path "udp-$name")" <<EOF
+{"protocol":"udp","name":"$name","listen_port":$listen_port,"backend":"$backend","enabled":true,"status":"enabled","updated_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
+EOF
+  rebuild_routes_index
+}
+
+cmd_udp_route_add() {
+  require_root
+  init_layout
+  local name="" listen_port="" backend=""
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --listen-port) listen_port="$2"; shift 2 ;;
+      --backend) backend="$2"; shift 2 ;;
+      *) die "未知 udp-route-add 参数：$1" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "必须提供 --name"
+  name="$(safe_route_name "$name")"
+  valid_port "$listen_port" || die "--listen-port 格式无效"
+  backend_is_safe "$backend" || die "UDP 后端必须是回环/内部地址，不能配置为 0.0.0.0。"
+  have nginx || die "未找到 nginx"
+  nginx_has_stream || die "未检测到 Nginx stream 模块。"
+  local snap
+  snap="$(snapshot_module routes)"
+  run mkdir -p "$NGINX_STREAM_DIR"
+  ensure_nginx_stream_include
+  write_file "$(udp_route_conf_path "$name")" <<EOF
+# Managed by vps-gateway. UDP stream route.
+server {
+    listen 127.0.0.1:${listen_port} udp reuseport;
+    listen [::1]:${listen_port} udp reuseport;
+    proxy_timeout 12h;
+    proxy_responses 0;
+    proxy_pass ${backend};
+}
+EOF
+  validate_nginx
+  schedule_rollback "routes" "routes" "5m" "$snap"
+  reload_nginx
+  write_udp_route_state "$name" "$listen_port" "$backend"
+  info "UDP 路由已启用：127.0.0.1:${listen_port}/udp -> ${backend}"
 }
 
 generate_inner_nginx_conf() {
@@ -1435,6 +1544,11 @@ cmd_route_list() {
   init_layout
   rebuild_routes_index
   cat "$BASE_DIR/state/routes.json"
+  local f
+  for f in "$NGINX_STREAM_DIR"/udp-*.conf; do
+    [[ -f "$f" ]] || continue
+    printf 'UDP 配置文件：%s\n' "$f"
+  done
 }
 
 cmd_route_disable() {
@@ -1484,7 +1598,24 @@ cmd_route_enable() {
 cmd_route_check() {
   local sni=""
   while (($#)); do case "$1" in --sni) sni="$2"; shift 2 ;; *) die "未知 route-check 参数：$1" ;; esac; done
-  valid_sni "$sni" || die "--sni 格式无效"
+  if ! valid_sni "$sni"; then
+    local udp_name udp_name_alt udp_json udp_conf udp_json_alt udp_conf_alt
+    udp_name="$(safe_route_name "$sni")"
+    udp_name_alt="${udp_name#udp-}"
+    udp_json="$(route_json_path "udp-$udp_name")"
+    udp_conf="$(udp_route_conf_path "$udp_name")"
+    udp_json_alt="$(route_json_path "udp-$udp_name_alt")"
+    udp_conf_alt="$(udp_route_conf_path "$udp_name_alt")"
+    if [[ -f "$udp_json" || -f "$udp_conf" || -f "$udp_json_alt" || -f "$udp_conf_alt" ]]; then
+      [[ -f "$udp_json" ]] && cat "$udp_json"
+      [[ -f "$udp_conf" ]] && cat "$udp_conf"
+      [[ -f "$udp_json_alt" ]] && cat "$udp_json_alt"
+      [[ -f "$udp_conf_alt" ]] && cat "$udp_conf_alt"
+      validate_nginx
+      return 0
+    fi
+    die "--sni 格式无效，且未找到同名 UDP 路由"
+  fi
   [[ -f "$(route_json_path "$sni")" ]] && cat "$(route_json_path "$sni")" || warn "未找到 $sni 的状态文件"
   grep -R "$sni" "$NGINX_STREAM_DIR" "$NGINX_HTTP_DIR" 2>/dev/null || true
   validate_nginx
@@ -2234,6 +2365,22 @@ ensure_nginx_stream_interactive() {
   cmd_nginx_stream_dependency_menu
 }
 
+ensure_nginx_stream_only_interactive() {
+  ensure_nginx_interactive || return 1
+  if nginx_has_stream; then
+    return 0
+  fi
+  print_warning "UDP 网关需要 Nginx stream 模块。"
+  if confirm_prompt "是否尝试安装 nginx-full 以获得 stream 支持？"; then
+    run_menu_action install_package_apt nginx-full
+  else
+    print_info "已取消安装 nginx-full。"
+    pause_return
+    return 1
+  fi
+  nginx_has_stream
+}
+
 sui_detected() {
   { systemctl list-units --type=service --all 2>/dev/null; ps -ef 2>/dev/null; check_ports; } | grep -Eiq 's-ui|sui'
 }
@@ -2361,12 +2508,78 @@ ensure_docker_interactive() {
   done
 }
 
+prompt_udp_backend() {
+  local backend=""
+  if ! backend="$(prompt_required "请输入 UDP 443 后端地址，例如 127.0.0.1:8443: ")"; then
+    return 1
+  fi
+  if ! backend_is_safe "$backend"; then
+    print_error "UDP 后端必须是安全的本机 / 内部地址，不能配置为 0.0.0.0。"
+    return 1
+  fi
+  printf '%s' "$backend"
+}
+
+cmd_gateway_install_proto_menu() {
+  while true; do
+    print_banner "选择 443 网关转发协议"
+    print_menu_item 1 "只转发 TCP 流量"
+    print_menu_item 2 "只转发 UDP 流量"
+    print_menu_item 3 "同时转发 TCP 和 UDP 流量"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        ensure_nginx_stream_interactive || continue
+        print_warning "如果 Reality 已经占用 443，请不要安装通用 443 网关。请确认当前 443 没有被 Reality 或其他服务直接占用。"
+        if confirm_prompt "确认安装 / 启用 TCP 443 网关吗？"; then
+          run_menu_action cmd_gateway_install --proto tcp
+        else
+          print_info "已取消安装 / 启用 TCP 443 网关。"
+          pause_return
+        fi
+        ;;
+      2)
+        ensure_nginx_stream_only_interactive || continue
+        local udp_backend=""
+        if ! udp_backend="$(prompt_udp_backend)"; then pause_return; continue; fi
+        print_warning "UDP 没有 TLS SNI，不能使用 TCP SNI 路由；UDP 443 会直接转发到指定后端。"
+        if confirm_prompt "确认安装 / 启用 UDP 443 网关吗？"; then
+          run_menu_action cmd_gateway_install --proto udp --udp-backend "$udp_backend"
+        else
+          print_info "已取消安装 / 启用 UDP 443 网关。"
+          pause_return
+        fi
+        ;;
+      3)
+        ensure_nginx_stream_interactive || continue
+        local udp_backend=""
+        if ! udp_backend="$(prompt_udp_backend)"; then pause_return; continue; fi
+        print_warning "TCP 将继续使用 ssl_preread / SNI 路由；UDP 443 会独立转发到指定后端。"
+        if confirm_prompt "确认安装 / 启用 TCP+UDP 443 网关吗？"; then
+          run_menu_action cmd_gateway_install --proto both --udp-backend "$udp_backend"
+        else
+          print_info "已取消安装 / 启用 TCP+UDP 443 网关。"
+          pause_return
+        fi
+        ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
 cmd_gateway_menu() {
   while true; do
-    print_banner "Nginx TCP 443 网关"
+    print_banner "Nginx TCP/UDP 443 网关"
     print_menu_item 1 "检查 Nginx stream / ssl_preread 支持"
-    print_menu_item 2 "安装 / 启用 TCP 443 网关"
-    print_menu_item 3 "禁用 TCP 443 网关"
+    print_menu_item 2 "安装 / 启用 443 网关"
+    print_menu_item 3 "禁用 443 网关"
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
@@ -2381,23 +2594,90 @@ cmd_gateway_menu() {
         run_menu_action cmd_gateway_check
         ;;
       2)
-        ensure_nginx_stream_interactive || continue
-        print_warning "如果 Reality 已经占用 443，请不要安装通用 TCP 443 网关。请确认当前 443 没有被 Reality 或其他服务直接占用。"
-        if confirm_prompt "确认安装 / 启用 TCP 443 网关吗？"; then
-          run_menu_action cmd_gateway_install
-        else
-          print_info "已取消安装 / 启用 TCP 443 网关。"
-          pause_return
-        fi
+        cmd_gateway_install_proto_menu
         ;;
       3)
         ensure_nginx_interactive || continue
-        if confirm_prompt "确认禁用 TCP 443 网关吗？"; then
+        if confirm_prompt "确认禁用 443 网关吗？"; then
           run_menu_action cmd_gateway_disable
         else
-          print_info "已取消禁用 TCP 443 网关。"
+          print_info "已取消禁用 443 网关。"
           pause_return
         fi
+        ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
+prompt_udp_route_backend() {
+  local backend=""
+  if ! backend="$(prompt_required "请输入 UDP 后端地址，例如 127.0.0.1:8443: ")"; then
+    return 1
+  fi
+  if ! backend_is_safe "$backend"; then
+    print_error "UDP 后端必须是安全的本机 / 内部地址，不能配置为 0.0.0.0。"
+    return 1
+  fi
+  printf '%s' "$backend"
+}
+
+prompt_tcp_route_args() {
+  local sni="" inner_port="" backend="" type="" cert_domain=""
+  if ! sni="$(prompt_required "请输入 SNI 域名: ")"; then return 1; fi
+  if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口: " "")"; then return 1; fi
+  if ! backend="$(prompt_required "请输入后端地址，例如 127.0.0.1:8000: ")"; then return 1; fi
+  type="$(prompt_optional "请输入路由类型 [默认 generic]: " "generic")"
+  cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
+  TCP_ROUTE_SNI="$sni"
+  TCP_ROUTE_INNER_PORT="$inner_port"
+  TCP_ROUTE_BACKEND="$backend"
+  TCP_ROUTE_TYPE="$type"
+  TCP_ROUTE_CERT_DOMAIN="$cert_domain"
+}
+
+prompt_udp_route_args() {
+  local name="" listen_port="" backend=""
+  if ! name="$(prompt_required "请输入 UDP 路由名称: ")"; then return 1; fi
+  if ! listen_port="$(prompt_port "请输入 UDP 监听端口: " "")"; then return 1; fi
+  if ! backend="$(prompt_udp_route_backend)"; then return 1; fi
+  UDP_ROUTE_NAME="$name"
+  UDP_ROUTE_LISTEN_PORT="$listen_port"
+  UDP_ROUTE_BACKEND="$backend"
+}
+
+cmd_route_add_protocol_menu() {
+  while true; do
+    print_banner "选择内层路由协议"
+    print_menu_item 1 "只转发 TCP 流量"
+    print_menu_item 2 "只转发 UDP 流量"
+    print_menu_item 3 "同时转发 TCP 和 UDP 流量"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        ensure_nginx_interactive || continue
+        if ! prompt_tcp_route_args; then pause_return; continue; fi
+        run_menu_action cmd_route_add --sni "$TCP_ROUTE_SNI" --inner-port "$TCP_ROUTE_INNER_PORT" --backend "$TCP_ROUTE_BACKEND" --type "$TCP_ROUTE_TYPE" --cert-domain "$TCP_ROUTE_CERT_DOMAIN"
+        ;;
+      2)
+        ensure_nginx_stream_only_interactive || continue
+        if ! prompt_udp_route_args; then pause_return; continue; fi
+        run_menu_action cmd_udp_route_add --name "$UDP_ROUTE_NAME" --listen-port "$UDP_ROUTE_LISTEN_PORT" --backend "$UDP_ROUTE_BACKEND"
+        ;;
+      3)
+        ensure_nginx_stream_interactive || continue
+        if ! prompt_tcp_route_args; then pause_return; continue; fi
+        if ! prompt_udp_route_args; then pause_return; continue; fi
+        menu_try cmd_route_add --sni "$TCP_ROUTE_SNI" --inner-port "$TCP_ROUTE_INNER_PORT" --backend "$TCP_ROUTE_BACKEND" --type "$TCP_ROUTE_TYPE" --cert-domain "$TCP_ROUTE_CERT_DOMAIN" || true
+        menu_try cmd_udp_route_add --name "$UDP_ROUTE_NAME" --listen-port "$UDP_ROUTE_LISTEN_PORT" --backend "$UDP_ROUTE_BACKEND" || true
+        pause_return
         ;;
       4) return 0 ;;
       *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
@@ -2425,14 +2705,7 @@ cmd_route_menu() {
     case "$c" in
       1) run_menu_action cmd_route_list ;;
       2)
-        ensure_nginx_interactive || continue
-        local sni="" inner_port="" backend="" type="" cert_domain=""
-        if ! sni="$(prompt_required "请输入 SNI 域名: ")"; then pause_return; continue; fi
-        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口: " "")"; then pause_return; continue; fi
-        if ! backend="$(prompt_required "请输入后端地址，例如 127.0.0.1:8000: ")"; then pause_return; continue; fi
-        type="$(prompt_optional "请输入路由类型 [默认 generic]: " "generic")"
-        cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
-        run_menu_action cmd_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --type "$type" --cert-domain "$cert_domain"
+        cmd_route_add_protocol_menu
         ;;
       3)
         ensure_nginx_interactive || continue
@@ -2448,7 +2721,7 @@ cmd_route_menu() {
       4)
         ensure_nginx_interactive || continue
         local sni=""
-        if ! sni="$(prompt_required "请输入要检查的 SNI 域名: ")"; then pause_return; continue; fi
+        if ! sni="$(prompt_required "请输入要检查的 SNI 域名或 UDP 路由名称: ")"; then pause_return; continue; fi
         run_menu_action cmd_route_check --sni "$sni"
         ;;
       5)
@@ -2927,7 +3200,7 @@ show_main_menu() {
   print_banner "VPS Gateway 管理面板"
   print_menu_item 1 "系统自检与安全评分"
   print_menu_item 2 "用户与 SSH 安全"
-  print_menu_item 3 "Nginx TCP 443 网关"
+  print_menu_item 3 "Nginx TCP/UDP 443 网关"
   print_menu_item 4 "Reality SNI 路由管理"
   print_menu_item 5 "添加 / 删除内层 Nginx SNI 路由"
   print_menu_item 6 "Vaultwarden 安全接入"
