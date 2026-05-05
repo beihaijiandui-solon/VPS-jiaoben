@@ -185,8 +185,18 @@ pause_return() {
 }
 
 run_menu_action() {
-  "$@" || true
+  local rc=0
+  set +e
+  trap - ERR
+  ( trap 'exit $?' ERR; set -Eeuo pipefail; "$@" )
+  rc=$?
+  trap 'on_error $LINENO' ERR
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    print_error "当前操作执行失败，退出码：$rc。请根据上方提示处理后重试。"
+  fi
   pause_return
+  return 0
 }
 
 run() {
@@ -1079,8 +1089,50 @@ cmd_reality_route_set_default() {
   info "Reality 默认后端已设置为 $backend"
 }
 
+ensure_reality_conf_interactive() {
+  local current_file="$1" candidate=""
+  ensure_nginx_interactive || return 1
+  if [[ -f "$current_file" ]]; then
+    REALITY_SELECTED_FILE="$current_file"
+    return 0
+  fi
+
+  while true; do
+    print_banner "Reality 配置缺失"
+    printf '未找到 Reality stream 配置文件：%s\n\n' "$current_file"
+    print_menu_item 1 "输入 Reality 配置文件路径"
+    print_menu_item 2 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-2]: " c; then
+      return 1
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        read -r -p "请输入 Reality 配置文件路径: " candidate
+        candidate="${candidate//$'\r'/}"
+        if [[ -z "$candidate" ]]; then
+          print_error "配置文件路径不能为空。"
+          pause_return
+          continue
+        fi
+        if [[ -f "$candidate" ]]; then
+          REALITY_SELECTED_FILE="$candidate"
+          return 0
+        fi
+        print_error "文件仍不存在：$candidate"
+        pause_return
+        ;;
+      2) return 1 ;;
+      *) print_warning "无效选项，请输入 1-2 之间的数字。" ;;
+    esac
+  done
+}
+
 show_reality_menu() {
   local file="$REALITY_CONF_DEFAULT"
+  REALITY_SELECTED_FILE="$file"
   while true; do
     print_banner "Reality SNI 路由管理"
     printf '当前配置：%s\n\n' "$file"
@@ -1099,26 +1151,41 @@ show_reality_menu() {
     fi
     c="${c//$'\r'/}"
     case "$c" in
-      1) run_menu_action cmd_reality_check --file "$file" ;;
-      2) run_menu_action cmd_reality_route_list --file "$file" ;;
+      1)
+        ensure_reality_conf_interactive "$file" || continue
+        file="$REALITY_SELECTED_FILE"
+        run_menu_action cmd_reality_check --file "$file"
+        ;;
+      2)
+        ensure_reality_conf_interactive "$file" || continue
+        file="$REALITY_SELECTED_FILE"
+        run_menu_action cmd_reality_route_list --file "$file"
+        ;;
       3)
+        ensure_reality_conf_interactive "$file" || continue
+        file="$REALITY_SELECTED_FILE"
         local sni="" backend=""
         read -r -p "请输入 SNI 域名: " sni
         read -r -p "请输入后端地址，例如 127.0.0.1:6443: " backend
         run_menu_action cmd_reality_route_add --file "$file" --sni "$sni" --backend "$backend"
         ;;
       4)
+        ensure_reality_conf_interactive "$file" || continue
+        file="$REALITY_SELECTED_FILE"
         local sni=""
         read -r -p "请输入要删除的 SNI 域名: " sni
         run_menu_action cmd_reality_route_remove --file "$file" --sni "$sni"
         ;;
       5)
+        ensure_reality_conf_interactive "$file" || continue
+        file="$REALITY_SELECTED_FILE"
         local backend=""
         read -r -p "请输入默认后端，例如 127.0.0.1:2443: " backend
         run_menu_action cmd_reality_route_set_default --file "$file" --backend "$backend"
         ;;
       6)
         read -r -p "请输入 Reality 配置文件路径: " file
+        file="${file//$'\r'/}"
         [[ -n "$file" ]] || file="$REALITY_CONF_DEFAULT"
         ;;
       7) return 0 ;;
@@ -1742,6 +1809,7 @@ cmd_ssh_import_key_menu() {
     case "$c" in
       1)
         local github=""
+        ensure_curl_interactive || continue
         read -r -p "请输入 GitHub 用户名: " github
         github="${github//$'\r'/}"
         if [[ -z "$github" ]]; then
@@ -1818,6 +1886,7 @@ cmd_ssh_menu() {
         cmd_ssh_import_key_menu
         ;;
       3)
+        ensure_openssh_interactive || continue
         print_warning "该操作会禁用 SSH 密码登录，只允许公钥登录。请确认已经至少导入一个可用 SSH 公钥，并保持当前 SSH 会话不要关闭。"
         if confirm_prompt "确认继续执行 SSH 加固吗？"; then
           run_menu_action cmd_ssh_harden
@@ -1827,6 +1896,7 @@ cmd_ssh_menu() {
         fi
         ;;
       4)
+        ensure_openssh_interactive || continue
         local port=""
         read -r -p "请输入 OpenSSH 内部监听端口 [默认 2222]: " port
         port="${port//$'\r'/}"
@@ -1840,6 +1910,7 @@ cmd_ssh_menu() {
         run_menu_action cmd_ssh_internalize --port "$port"
         ;;
       5)
+        ensure_openssh_interactive || continue
         run_menu_action cmd_ssh_check
         ;;
       6)
@@ -1891,6 +1962,303 @@ prompt_proto() {
   printf '%s' "$proto"
 }
 
+install_package_apt() {
+  local package="$1"
+  require_root
+  run apt-get update
+  run apt-get install -y "$package"
+}
+
+ensure_command_interactive() {
+  local command_name="$1" package_name="$2"
+  have "$command_name" && return 0
+  print_warning "未检测到 ${command_name}，当前操作需要安装 ${package_name}。"
+  if confirm_prompt "是否现在通过 apt 安装 ${package_name}？"; then
+    run_menu_action install_package_apt "$package_name"
+    have "$command_name"
+    return $?
+  fi
+  print_info "已取消安装 ${package_name}。"
+  return 1
+}
+
+install_remote_script_interactive() {
+  local url="$1" label="${2:-远程安装脚本}" version_arg="${3:-}"
+  local tmp=""
+  [[ "$url" =~ ^https:// ]] || { print_error "只允许 https URL。"; return 1; }
+  print_warning "远程脚本存在风险，请确认来源可信：$url"
+  confirm_prompt "是否下载并检查 ${label}？" || return 1
+  tmp="$(mktemp)"
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    print_error "下载失败：$url"
+    return 1
+  fi
+  print_info "脚本来源：$url"
+  print_info "脚本前 20 行预览："
+  sed -n '1,20p' "$tmp" || true
+  if confirm_prompt "确认执行该脚本吗？"; then
+    local rc=0
+    set +e
+    if [[ -n "$version_arg" ]]; then
+      bash "$tmp" "$version_arg"
+      rc=$?
+    else
+      bash "$tmp"
+      rc=$?
+    fi
+    set -e
+    rm -f "$tmp"
+    return "$rc"
+  fi
+  rm -f "$tmp"
+  print_info "已取消执行远程脚本。"
+  return 1
+}
+
+install_nginx_org_repo() {
+  local branch="$1"
+  require_root
+  local os_id="" codename="" repo_url=""
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    os_id="${ID:-ubuntu}"
+    codename="${VERSION_CODENAME:-}"
+  fi
+  [[ -n "$codename" ]] || codename="$(lsb_release -cs 2>/dev/null || true)"
+  [[ -n "$codename" ]] || { print_error "无法识别系统 codename。"; return 1; }
+  case "$os_id" in
+    debian) repo_url="http://nginx.org/packages${branch}/debian" ;;
+    ubuntu|*) repo_url="http://nginx.org/packages${branch}/ubuntu" ;;
+  esac
+  run apt-get update
+  run apt-get install -y curl gnupg2 ca-certificates lsb-release
+  run mkdir -p /etc/apt/keyrings
+  run sh -c "curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg"
+  run sh -c "printf 'deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
+  run apt-get update
+  run apt-get install -y nginx
+}
+
+cmd_nginx_dependency_menu() {
+  while true; do
+    print_banner "Nginx 依赖缺失"
+    printf '当前系统未检测到 nginx。该功能需要 nginx 才能继续。\n\n'
+    print_menu_item 1 "使用系统软件源安装 nginx-full"
+    print_menu_item 2 "使用 Nginx 官方软件源安装最新版稳定版"
+    print_menu_item 3 "使用 Nginx 官方 mainline 源安装最新版 mainline"
+    print_menu_item 4 "指定 apt 包名安装"
+    print_menu_item 5 "指定下载链接或安装脚本 URL"
+    print_menu_item 6 "暂不安装，返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-6]: " c; then
+      return 1
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action install_package_apt nginx-full ;;
+      2)
+        print_warning "该操作会添加 nginx.org 官方 stable apt 源。"
+        if confirm_prompt "确认继续吗？"; then run_menu_action install_nginx_org_repo ""; fi
+        ;;
+      3)
+        print_warning "mainline 是更新分支，适合需要最新功能的用户。该操作会添加 nginx.org 官方 mainline apt 源。"
+        if confirm_prompt "确认继续吗？"; then run_menu_action install_nginx_org_repo "/mainline"; fi
+        ;;
+      4)
+        local package=""
+        if ! package="$(prompt_required "请输入 apt 包名，例如 nginx、nginx-full、nginx-extras: ")"; then pause_return; continue; fi
+        run_menu_action install_package_apt "$package"
+        ;;
+      5)
+        local url=""
+        if ! url="$(prompt_required "请输入 https 下载链接或安装脚本 URL: ")"; then pause_return; continue; fi
+        ensure_curl_interactive || continue
+        run_menu_action install_remote_script_interactive "$url" "Nginx 自定义安装脚本"
+        ;;
+      6) return 1 ;;
+      *) print_warning "无效选项，请输入 1-6 之间的数字。" ;;
+    esac
+    if have nginx; then
+      print_success "已检测到 nginx。"
+      nginx -v 2>&1 || true
+      nginx -t 2>/dev/null || print_warning "nginx -t 未通过，请检查配置。"
+      return 0
+    fi
+    print_warning "仍未检测到 nginx，请继续选择安装方式或返回。"
+  done
+}
+
+ensure_nginx_interactive() {
+  have nginx && return 0
+  cmd_nginx_dependency_menu
+}
+
+cmd_nginx_stream_dependency_menu() {
+  while true; do
+    print_banner "Nginx stream / ssl_preread 缺失"
+    printf '当前 nginx 未检测到 stream 或 ssl_preread 支持，TCP 443 网关可能无法工作。\n\n'
+    print_menu_item 1 "尝试安装 nginx-full"
+    print_menu_item 2 "尝试安装 Nginx stream 动态模块包"
+    print_menu_item 3 "使用 Nginx 官方源重新安装"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      return 1
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) if confirm_prompt "确认安装 nginx-full 吗？"; then run_menu_action install_package_apt nginx-full; fi ;;
+      2) if confirm_prompt "确认尝试安装 libnginx-mod-stream 吗？"; then run_menu_action install_package_apt libnginx-mod-stream; fi ;;
+      3) if confirm_prompt "确认使用 Nginx 官方 stable 源重新安装 nginx 吗？"; then run_menu_action install_nginx_org_repo ""; fi ;;
+      4) return 1 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+    if nginx_has_stream && nginx_has_ssl_preread; then
+      print_success "已检测到 stream 和 ssl_preread 支持。"
+      return 0
+    fi
+    print_warning "仍未检测到完整 stream / ssl_preread 支持。"
+  done
+}
+
+ensure_nginx_stream_interactive() {
+  ensure_nginx_interactive || return 1
+  if nginx_has_stream && nginx_has_ssl_preread; then
+    return 0
+  fi
+  cmd_nginx_stream_dependency_menu
+}
+
+sui_detected() {
+  { systemctl list-units --type=service --all 2>/dev/null; ps -ef 2>/dev/null; check_ports; } | grep -Eiq 's-ui|sui'
+}
+
+vaultwarden_detected() {
+  { have docker && docker ps --format '{{.Names}} {{.Image}} {{.Ports}}' 2>/dev/null || true; systemctl list-units --type=service --all 2>/dev/null; check_ports; } | grep -Eiq 'vaultwarden|bitwarden|:8000|:3012'
+}
+
+cmd_sui_install_menu() {
+  local official_url="https://raw.githubusercontent.com/alireza0/s-ui/master/install.sh"
+  while true; do
+    print_banner "安装 / 更新 S-UI 面板"
+    print_menu_item 1 "使用官方安装脚本安装 / 更新最新版"
+    print_menu_item 2 "指定版本安装"
+    print_menu_item 3 "指定安装脚本 URL"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        ensure_curl_interactive || continue
+        run_menu_action install_remote_script_interactive "$official_url" "S-UI 官方安装脚本"
+        run_menu_action detect_sui
+        ;;
+      2)
+        local version=""
+        if ! version="$(prompt_required "请输入版本号，例如 v1.3.8: ")"; then pause_return; continue; fi
+        print_warning "如果官方脚本不支持版本参数，请改用自定义安装脚本 URL。"
+        ensure_curl_interactive || continue
+        run_menu_action install_remote_script_interactive "$official_url" "S-UI 官方安装脚本" "$version"
+        run_menu_action detect_sui
+        ;;
+      3)
+        local url=""
+        if ! url="$(prompt_required "请输入自定义安装脚本 https URL: ")"; then pause_return; continue; fi
+        ensure_curl_interactive || continue
+        run_menu_action install_remote_script_interactive "$url" "S-UI 自定义安装脚本"
+        run_menu_action detect_sui
+        ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
+ensure_sui_interactive() {
+  sui_detected && return 0
+  print_warning "当前未检测到 S-UI。"
+  if confirm_prompt "是否先进入安装 / 更新 S-UI 面板？"; then
+    cmd_sui_install_menu
+    sui_detected
+    return $?
+  fi
+  return 1
+}
+
+ensure_ufw_interactive() {
+  have ufw && return 0
+  ensure_command_interactive ufw ufw
+}
+
+ensure_fail2ban_interactive() {
+  have fail2ban-client && return 0
+  ensure_command_interactive fail2ban-client fail2ban
+}
+
+ensure_curl_interactive() {
+  have curl && return 0
+  ensure_command_interactive curl curl
+}
+
+ensure_openssh_interactive() {
+  { have sshd || [[ -x /usr/sbin/sshd ]]; } && return 0
+  ensure_command_interactive sshd openssh-server
+}
+
+docker_daemon_usable() {
+  have docker && docker info >/dev/null 2>&1
+}
+
+ensure_docker_interactive() {
+  docker_daemon_usable && return 0
+  while true; do
+    if have docker; then
+      print_banner "Docker 服务不可用"
+      printf '检测到 docker 命令，但 Docker daemon 当前不可用，无法读取容器端口。\n\n'
+      print_menu_item 1 "尝试启动 Docker 服务"
+      print_menu_item 2 "通过 apt 安装 / 修复 docker.io"
+      print_menu_item 3 "查看提示并自行安装官方 Docker"
+      print_menu_item 4 "返回上一级"
+    else
+      print_banner "Docker 依赖缺失"
+      printf '当前未安装 Docker，无法进行 Docker 暴露面检查。\n\n'
+      print_menu_item 1 "通过 apt 安装 docker.io"
+      print_menu_item 2 "查看提示并自行安装官方 Docker"
+      print_menu_item 3 "返回上一级"
+    fi
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作: " c; then
+      return 1
+    fi
+    c="${c//$'\r'/}"
+    if have docker; then
+      case "$c" in
+        1) run_menu_action systemctl start docker ;;
+        2) run_menu_action install_package_apt docker.io ;;
+        3) print_info "请参考 Docker 官方文档安装 Docker Engine。安装或启动 daemon 后重新进入本菜单。"; pause_return ;;
+        4) return 1 ;;
+        *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+      esac
+    else
+      case "$c" in
+        1) run_menu_action install_package_apt docker.io ;;
+        2) print_info "请参考 Docker 官方文档安装 Docker Engine。安装完成后重新进入本菜单。"; pause_return ;;
+        3) return 1 ;;
+        *) print_warning "无效选项，请输入 1-3 之间的数字。" ;;
+      esac
+    fi
+    docker_daemon_usable && return 0
+  done
+}
+
 cmd_gateway_menu() {
   while true; do
     print_banner "Nginx TCP 443 网关"
@@ -1906,8 +2274,12 @@ cmd_gateway_menu() {
     fi
     c="${c//$'\r'/}"
     case "$c" in
-      1) run_menu_action cmd_gateway_check ;;
+      1)
+        ensure_nginx_interactive || continue
+        run_menu_action cmd_gateway_check
+        ;;
       2)
+        ensure_nginx_stream_interactive || continue
         print_warning "如果 Reality 已经占用 443，请不要安装通用 TCP 443 网关。请确认当前 443 没有被 Reality 或其他服务直接占用。"
         if confirm_prompt "确认安装 / 启用 TCP 443 网关吗？"; then
           run_menu_action cmd_gateway_install
@@ -1917,6 +2289,7 @@ cmd_gateway_menu() {
         fi
         ;;
       3)
+        ensure_nginx_interactive || continue
         if confirm_prompt "确认禁用 TCP 443 网关吗？"; then
           run_menu_action cmd_gateway_disable
         else
@@ -1950,6 +2323,7 @@ cmd_route_menu() {
     case "$c" in
       1) run_menu_action cmd_route_list ;;
       2)
+        ensure_nginx_interactive || continue
         local sni="" inner_port="" backend="" type="" cert_domain=""
         if ! sni="$(prompt_required "请输入 SNI 域名: ")"; then pause_return; continue; fi
         if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口: " "")"; then pause_return; continue; fi
@@ -1959,6 +2333,7 @@ cmd_route_menu() {
         run_menu_action cmd_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --type "$type" --cert-domain "$cert_domain"
         ;;
       3)
+        ensure_nginx_interactive || continue
         local sni=""
         if ! sni="$(prompt_required "请输入要删除的 SNI 域名: ")"; then pause_return; continue; fi
         if confirm_prompt "确认删除路由 ${sni} 吗？"; then
@@ -1969,16 +2344,19 @@ cmd_route_menu() {
         fi
         ;;
       4)
+        ensure_nginx_interactive || continue
         local sni=""
         if ! sni="$(prompt_required "请输入要检查的 SNI 域名: ")"; then pause_return; continue; fi
         run_menu_action cmd_route_check --sni "$sni"
         ;;
       5)
+        ensure_nginx_interactive || continue
         local sni=""
         if ! sni="$(prompt_required "请输入要禁用的 SNI 域名: ")"; then pause_return; continue; fi
         run_menu_action cmd_route_disable --sni "$sni"
         ;;
       6)
+        ensure_nginx_interactive || continue
         local sni=""
         if ! sni="$(prompt_required "请输入要启用的 SNI 域名: ")"; then pause_return; continue; fi
         run_menu_action cmd_route_enable --sni "$sni"
@@ -2009,6 +2387,20 @@ cmd_vaultwarden_menu() {
       1) run_menu_action cmd_vaultwarden_detect ;;
       2) run_menu_action cmd_vaultwarden_secure ;;
       3)
+        if ! vaultwarden_detected; then
+          print_warning "当前未检测到 Vaultwarden 服务或容器。"
+          print_menu_item 1 "查看部署建议"
+          print_menu_item 2 "我已经手动安装，继续配置路由"
+          print_menu_item 3 "返回上一级"
+          read -r -p "请选择操作 [1-3]: " vw_choice
+          vw_choice="${vw_choice//$'\r'/}"
+          case "$vw_choice" in
+            1) run_menu_action cmd_vaultwarden_secure; continue ;;
+            2) ;;
+            3|*) continue ;;
+          esac
+        fi
+        ensure_nginx_interactive || continue
         local sni="" inner_port="" backend="" cert_domain=""
         if ! sni="$(prompt_required "请输入 Vaultwarden 访问域名 SNI: ")"; then pause_return; continue; fi
         if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8444]: " "8444")"; then pause_return; continue; fi
@@ -2028,20 +2420,24 @@ cmd_sui_menu() {
   while true; do
     print_banner "S-UI 安全接入"
     print_menu_item 1 "检测 S-UI 服务与监听端口"
-    print_menu_item 2 "检查 S-UI 暴露风险"
-    print_menu_item 3 "添加 S-UI SNI 路由"
-    print_menu_item 4 "返回上一级"
+    print_menu_item 2 "安装 / 更新 S-UI 面板"
+    print_menu_item 3 "检查 S-UI 暴露风险"
+    print_menu_item 4 "添加 S-UI SNI 路由"
+    print_menu_item 5 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作 [1-5]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
     c="${c//$'\r'/}"
     case "$c" in
       1) run_menu_action cmd_sui_detect ;;
-      2) run_menu_action cmd_sui_secure ;;
-      3)
+      2) cmd_sui_install_menu ;;
+      3) run_menu_action cmd_sui_secure ;;
+      4)
+        ensure_sui_interactive || continue
+        ensure_nginx_interactive || continue
         local sni="" inner_port="" backend="" cert_domain=""
         if ! sni="$(prompt_required "请输入 S-UI 访问域名 SNI: ")"; then pause_return; continue; fi
         if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8445]: " "8445")"; then pause_return; continue; fi
@@ -2049,8 +2445,8 @@ cmd_sui_menu() {
         cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
         run_menu_action cmd_sui_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --cert-domain "$cert_domain"
         ;;
-      4) return 0 ;;
-      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+      5) return 0 ;;
+      *) print_warning "无效选项，请输入 1-5 之间的数字。" ;;
     esac
   done
 }
@@ -2076,6 +2472,19 @@ cmd_cert_menu() {
     case "$c" in
       1) run_menu_action cmd_cert_set_cloudflare ;;
       2)
+        ensure_curl_interactive || continue
+        ensure_command_interactive socat socat || continue
+        ensure_command_interactive cron cron || continue
+        ensure_nginx_interactive || continue
+        if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+          print_warning "未检测到 acme.sh，签发证书前需要先安装。"
+          if confirm_prompt "是否现在安装 acme.sh？"; then
+            run_menu_action cmd_cert_install_acme
+          else
+            pause_return
+            continue
+          fi
+        fi
         local domain="" email=""
         if ! domain="$(prompt_required "请输入证书域名: ")"; then pause_return; continue; fi
         if ! email="$(prompt_required "请输入邮箱: ")"; then pause_return; continue; fi
@@ -2088,9 +2497,23 @@ cmd_cert_menu() {
         if ! key="$(prompt_required "请输入 privkey.pem 路径: ")"; then pause_return; continue; fi
         run_menu_action cmd_cert_import --domain "$domain" --cert "$cert" --key "$key"
         ;;
-      4) run_menu_action cmd_cert_status ;;
+      4)
+        ensure_command_interactive openssl openssl || continue
+        run_menu_action cmd_cert_status
+        ;;
       5) run_menu_action cmd_cert_list ;;
       6)
+        ensure_nginx_interactive || continue
+        if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+          print_warning "未检测到 acme.sh，请先安装 acme.sh。"
+          if confirm_prompt "是否现在安装 acme.sh？"; then
+            ensure_curl_interactive || continue
+            run_menu_action cmd_cert_install_acme
+          else
+            pause_return
+            continue
+          fi
+        fi
         if confirm_prompt "确认执行证书续期吗？"; then
           run_menu_action cmd_cert_renew
         else
@@ -2134,6 +2557,7 @@ cmd_firewall_menu() {
     case "$c" in
       1) run_menu_action cmd_firewall_check ;;
       2)
+        ensure_ufw_interactive || continue
         print_warning "高危操作：将分阶段收紧防火墙，只允许 TCP 443 入站。请先确认 SSH over 443 可用。"
         if confirm_prompt "确认继续执行防火墙收紧吗？"; then
           run_menu_action cmd_firewall_stage
@@ -2152,12 +2576,14 @@ cmd_firewall_menu() {
         fi
         ;;
       5)
+        ensure_ufw_interactive || continue
         local port="" proto=""
         if ! port="$(prompt_port "请输入要开放的端口: " "")"; then pause_return; continue; fi
         if ! proto="$(prompt_proto)"; then pause_return; continue; fi
         run_menu_action cmd_firewall_open --port "$port" --proto "$proto"
         ;;
       6)
+        ensure_ufw_interactive || continue
         local port="" proto=""
         if ! port="$(prompt_port "请输入要关闭的端口: " "")"; then pause_return; continue; fi
         if ! proto="$(prompt_proto)"; then pause_return; continue; fi
@@ -2188,9 +2614,18 @@ cmd_fail2ban_menu() {
     c="${c//$'\r'/}"
     case "$c" in
       1) run_menu_action cmd_fail2ban_install ;;
-      2) run_menu_action cmd_fail2ban_config_ssh ;;
-      3) run_menu_action cmd_fail2ban_status ;;
-      4) run_menu_action cmd_login_notify_enable ;;
+      2)
+        ensure_fail2ban_interactive || continue
+        run_menu_action cmd_fail2ban_config_ssh
+        ;;
+      3)
+        ensure_fail2ban_interactive || continue
+        run_menu_action cmd_fail2ban_status
+        ;;
+      4)
+        ensure_curl_interactive || continue
+        run_menu_action cmd_login_notify_enable
+        ;;
       5) run_menu_action cmd_login_notify_disable ;;
       6) run_menu_action cmd_login_notify_test ;;
       7) return 0 ;;
@@ -2214,8 +2649,14 @@ cmd_docker_menu() {
     fi
     c="${c//$'\r'/}"
     case "$c" in
-      1) run_menu_action cmd_docker_list_ports ;;
-      2) run_menu_action cmd_docker_check_exposure ;;
+      1)
+        ensure_docker_interactive || continue
+        run_menu_action cmd_docker_list_ports
+        ;;
+      2)
+        ensure_docker_interactive || continue
+        run_menu_action cmd_docker_check_exposure
+        ;;
       3) run_menu_action cmd_docker_suggest_fix ;;
       4) return 0 ;;
       *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
