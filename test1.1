@@ -1852,6 +1852,456 @@ cmd_ssh_menu() {
   done
 }
 
+prompt_required() {
+  local prompt="$1" value=""
+  read -r -p "$prompt" value
+  value="${value//$'\r'/}"
+  if [[ -z "$value" ]]; then
+    print_error "该输入不能为空。"
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+prompt_optional() {
+  local prompt="$1" default="${2:-}" value=""
+  read -r -p "$prompt" value
+  value="${value//$'\r'/}"
+  [[ -n "$value" ]] || value="$default"
+  printf '%s' "$value"
+}
+
+prompt_port() {
+  local prompt="$1" default="${2:-}" port=""
+  port="$(prompt_optional "$prompt" "$default")"
+  if ! valid_port "$port"; then
+    print_error "端口无效，请输入 1..65535 之间的数字。"
+    return 1
+  fi
+  printf '%s' "$port"
+}
+
+prompt_proto() {
+  local proto=""
+  proto="$(prompt_optional "请输入协议 [默认 tcp]: " "tcp")"
+  if [[ "$proto" != "tcp" && "$proto" != "udp" ]]; then
+    print_error "协议无效，只允许 tcp 或 udp。"
+    return 1
+  fi
+  printf '%s' "$proto"
+}
+
+cmd_gateway_menu() {
+  while true; do
+    print_banner "Nginx TCP 443 网关"
+    print_menu_item 1 "检查 Nginx stream / ssl_preread 支持"
+    print_menu_item 2 "安装 / 启用 TCP 443 网关"
+    print_menu_item 3 "禁用 TCP 443 网关"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_gateway_check ;;
+      2)
+        print_warning "如果 Reality 已经占用 443，请不要安装通用 TCP 443 网关。请确认当前 443 没有被 Reality 或其他服务直接占用。"
+        if confirm_prompt "确认安装 / 启用 TCP 443 网关吗？"; then
+          run_menu_action cmd_gateway_install
+        else
+          print_info "已取消安装 / 启用 TCP 443 网关。"
+          pause_return
+        fi
+        ;;
+      3)
+        if confirm_prompt "确认禁用 TCP 443 网关吗？"; then
+          run_menu_action cmd_gateway_disable
+        else
+          print_info "已取消禁用 TCP 443 网关。"
+          pause_return
+        fi
+        ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_route_menu() {
+  while true; do
+    print_banner "内层 Nginx SNI 路由"
+    print_menu_item 1 "查看路由列表"
+    print_menu_item 2 "添加 / 更新路由"
+    print_menu_item 3 "删除路由"
+    print_menu_item 4 "检查指定路由"
+    print_menu_item 5 "禁用指定路由"
+    print_menu_item 6 "启用指定路由"
+    print_menu_item 7 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-7]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_route_list ;;
+      2)
+        local sni="" inner_port="" backend="" type="" cert_domain=""
+        if ! sni="$(prompt_required "请输入 SNI 域名: ")"; then pause_return; continue; fi
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口: " "")"; then pause_return; continue; fi
+        if ! backend="$(prompt_required "请输入后端地址，例如 127.0.0.1:8000: ")"; then pause_return; continue; fi
+        type="$(prompt_optional "请输入路由类型 [默认 generic]: " "generic")"
+        cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
+        run_menu_action cmd_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --type "$type" --cert-domain "$cert_domain"
+        ;;
+      3)
+        local sni=""
+        if ! sni="$(prompt_required "请输入要删除的 SNI 域名: ")"; then pause_return; continue; fi
+        if confirm_prompt "确认删除路由 ${sni} 吗？"; then
+          run_menu_action cmd_route_remove --sni "$sni"
+        else
+          print_info "已取消删除路由。"
+          pause_return
+        fi
+        ;;
+      4)
+        local sni=""
+        if ! sni="$(prompt_required "请输入要检查的 SNI 域名: ")"; then pause_return; continue; fi
+        run_menu_action cmd_route_check --sni "$sni"
+        ;;
+      5)
+        local sni=""
+        if ! sni="$(prompt_required "请输入要禁用的 SNI 域名: ")"; then pause_return; continue; fi
+        run_menu_action cmd_route_disable --sni "$sni"
+        ;;
+      6)
+        local sni=""
+        if ! sni="$(prompt_required "请输入要启用的 SNI 域名: ")"; then pause_return; continue; fi
+        run_menu_action cmd_route_enable --sni "$sni"
+        ;;
+      7) return 0 ;;
+      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_vaultwarden_menu() {
+  while true; do
+    print_banner "Vaultwarden 安全接入"
+    print_menu_item 1 "检测 Vaultwarden 服务与端口"
+    print_menu_item 2 "检查 Vaultwarden 暴露风险"
+    print_menu_item 3 "添加 Vaultwarden SNI 路由"
+    print_menu_item 4 "查看 /admin 加固建议"
+    print_menu_item 5 "创建 Vaultwarden 备份元数据"
+    print_menu_item 6 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-6]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_vaultwarden_detect ;;
+      2) run_menu_action cmd_vaultwarden_secure ;;
+      3)
+        local sni="" inner_port="" backend="" cert_domain=""
+        if ! sni="$(prompt_required "请输入 Vaultwarden 访问域名 SNI: ")"; then pause_return; continue; fi
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8444]: " "8444")"; then pause_return; continue; fi
+        backend="$(prompt_optional "请输入 Vaultwarden 后端地址 [默认 127.0.0.1:8000]: " "127.0.0.1:8000")"
+        cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
+        run_menu_action cmd_vaultwarden_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --cert-domain "$cert_domain"
+        ;;
+      4) run_menu_action cmd_vaultwarden_admin_protect ;;
+      5) run_menu_action cmd_vaultwarden_backup ;;
+      6) return 0 ;;
+      *) print_warning "无效选项，请输入 1-6 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_sui_menu() {
+  while true; do
+    print_banner "S-UI 安全接入"
+    print_menu_item 1 "检测 S-UI 服务与监听端口"
+    print_menu_item 2 "检查 S-UI 暴露风险"
+    print_menu_item 3 "添加 S-UI SNI 路由"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_sui_detect ;;
+      2) run_menu_action cmd_sui_secure ;;
+      3)
+        local sni="" inner_port="" backend="" cert_domain=""
+        if ! sni="$(prompt_required "请输入 S-UI 访问域名 SNI: ")"; then pause_return; continue; fi
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8445]: " "8445")"; then pause_return; continue; fi
+        if ! backend="$(prompt_required "请输入 S-UI 后端地址，例如 127.0.0.1:2095: ")"; then pause_return; continue; fi
+        cert_domain="$(prompt_optional "请输入证书域名 [默认使用 SNI 域名]: " "$sni")"
+        run_menu_action cmd_sui_route_add --sni "$sni" --inner-port "$inner_port" --backend "$backend" --cert-domain "$cert_domain"
+        ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_cert_menu() {
+  while true; do
+    print_banner "证书管理"
+    print_menu_item 1 "配置 Cloudflare DNS API Token"
+    print_menu_item 2 "签发证书"
+    print_menu_item 3 "导入已有证书"
+    print_menu_item 4 "查看证书状态"
+    print_menu_item 5 "查看证书列表"
+    print_menu_item 6 "续期证书"
+    print_menu_item 7 "删除证书"
+    print_menu_item 8 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-8]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_cert_set_cloudflare ;;
+      2)
+        local domain="" email=""
+        if ! domain="$(prompt_required "请输入证书域名: ")"; then pause_return; continue; fi
+        if ! email="$(prompt_required "请输入邮箱: ")"; then pause_return; continue; fi
+        run_menu_action cmd_cert_issue --domain "$domain" --email "$email"
+        ;;
+      3)
+        local domain="" cert="" key=""
+        if ! domain="$(prompt_required "请输入证书域名: ")"; then pause_return; continue; fi
+        if ! cert="$(prompt_required "请输入 fullchain.pem 路径: ")"; then pause_return; continue; fi
+        if ! key="$(prompt_required "请输入 privkey.pem 路径: ")"; then pause_return; continue; fi
+        run_menu_action cmd_cert_import --domain "$domain" --cert "$cert" --key "$key"
+        ;;
+      4) run_menu_action cmd_cert_status ;;
+      5) run_menu_action cmd_cert_list ;;
+      6)
+        if confirm_prompt "确认执行证书续期吗？"; then
+          run_menu_action cmd_cert_renew
+        else
+          print_info "已取消证书续期。"
+          pause_return
+        fi
+        ;;
+      7)
+        local domain=""
+        if ! domain="$(prompt_required "请输入要删除证书的域名: ")"; then pause_return; continue; fi
+        if confirm_prompt "确认删除 ${domain} 的证书吗？"; then
+          run_menu_action cmd_cert_remove --domain "$domain"
+        else
+          print_info "已取消删除证书。"
+          pause_return
+        fi
+        ;;
+      8) return 0 ;;
+      *) print_warning "无效选项，请输入 1-8 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_firewall_menu() {
+  while true; do
+    print_banner "防火墙管理"
+    print_menu_item 1 "查看防火墙状态"
+    print_menu_item 2 "分阶段收紧：只允许 TCP 443 入站"
+    print_menu_item 3 "确认防火墙变更"
+    print_menu_item 4 "回滚防火墙变更"
+    print_menu_item 5 "手动开放端口"
+    print_menu_item 6 "手动关闭端口"
+    print_menu_item 7 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-7]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_firewall_check ;;
+      2)
+        print_warning "高危操作：将分阶段收紧防火墙，只允许 TCP 443 入站。请先确认 SSH over 443 可用。"
+        if confirm_prompt "确认继续执行防火墙收紧吗？"; then
+          run_menu_action cmd_firewall_stage
+        else
+          print_info "已取消防火墙收紧。"
+          pause_return
+        fi
+        ;;
+      3) run_menu_action cmd_firewall_confirm ;;
+      4)
+        if confirm_prompt "确认回滚防火墙变更吗？"; then
+          run_menu_action cmd_rollback --module firewall
+        else
+          print_info "已取消防火墙回滚。"
+          pause_return
+        fi
+        ;;
+      5)
+        local port="" proto=""
+        if ! port="$(prompt_port "请输入要开放的端口: " "")"; then pause_return; continue; fi
+        if ! proto="$(prompt_proto)"; then pause_return; continue; fi
+        run_menu_action cmd_firewall_open --port "$port" --proto "$proto"
+        ;;
+      6)
+        local port="" proto=""
+        if ! port="$(prompt_port "请输入要关闭的端口: " "")"; then pause_return; continue; fi
+        if ! proto="$(prompt_proto)"; then pause_return; continue; fi
+        run_menu_action cmd_firewall_close --port "$port" --proto "$proto"
+        ;;
+      7) return 0 ;;
+      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_fail2ban_menu() {
+  while true; do
+    print_banner "Fail2ban / 登录通知"
+    print_menu_item 1 "安装 Fail2ban"
+    print_menu_item 2 "配置 SSH Fail2ban"
+    print_menu_item 3 "查看 Fail2ban 状态"
+    print_menu_item 4 "启用 SSH 登录通知"
+    print_menu_item 5 "禁用 SSH 登录通知"
+    print_menu_item 6 "测试 SSH 登录通知"
+    print_menu_item 7 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-7]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_fail2ban_install ;;
+      2) run_menu_action cmd_fail2ban_config_ssh ;;
+      3) run_menu_action cmd_fail2ban_status ;;
+      4) run_menu_action cmd_login_notify_enable ;;
+      5) run_menu_action cmd_login_notify_disable ;;
+      6) run_menu_action cmd_login_notify_test ;;
+      7) return 0 ;;
+      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_docker_menu() {
+  while true; do
+    print_banner "Docker 暴露面检查"
+    print_menu_item 1 "查看容器端口映射"
+    print_menu_item 2 "检查公网端口暴露"
+    print_menu_item 3 "查看修复建议"
+    print_menu_item 4 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-4]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_docker_list_ports ;;
+      2) run_menu_action cmd_docker_check_exposure ;;
+      3) run_menu_action cmd_docker_suggest_fix ;;
+      4) return 0 ;;
+      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_backup_menu() {
+  while true; do
+    print_banner "备份 / 回滚"
+    print_menu_item 1 "创建完整备份"
+    print_menu_item 2 "查看备份列表"
+    print_menu_item 3 "查看待确认回滚状态"
+    print_menu_item 4 "回滚指定模块"
+    print_menu_item 5 "确认并取消指定回滚任务"
+    print_menu_item 6 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-6]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1) run_menu_action cmd_backup ;;
+      2) run_menu_action cmd_backup_list ;;
+      3) run_menu_action cmd_rollback_status ;;
+      4)
+        local module=""
+        if ! module="$(prompt_required "请输入要回滚的模块 ssh/nginx/firewall/routes/certs/fail2ban/all: ")"; then pause_return; continue; fi
+        if confirm_prompt "确认回滚模块 ${module} 吗？"; then
+          run_menu_action cmd_rollback --module "$module"
+        else
+          print_info "已取消回滚操作。"
+          pause_return
+        fi
+        ;;
+      5)
+        local tag=""
+        tag="$(prompt_optional "请输入要确认取消的回滚 tag [默认 all]: " "all")"
+        run_menu_action cancel_rollback "$tag"
+        ;;
+      6) return 0 ;;
+      *) print_warning "无效选项，请输入 1-6 之间的数字。" ;;
+    esac
+  done
+}
+
+cmd_uninstall_menu() {
+  while true; do
+    print_banner "卸载 / 恢复"
+    print_menu_item 1 "卸载 vps-gateway，保留证书"
+    print_menu_item 2 "卸载并恢复 SSH 配置"
+    print_menu_item 3 "卸载并恢复 Nginx 配置"
+    print_menu_item 4 "卸载并同时恢复 SSH 和 Nginx 配置"
+    print_menu_item 5 "返回上一级"
+    printf '\n'
+    ui_line
+    if ! read -r -p "请选择操作 [1-5]: " c; then
+      echo "已返回主菜单。"
+      return 0
+    fi
+    c="${c//$'\r'/}"
+    case "$c" in
+      1)
+        print_warning "高危操作：将执行卸载流程，但保留证书。"
+        if confirm_prompt "确认继续吗？"; then run_menu_action cmd_uninstall --keep-certs; else print_info "已取消卸载。"; pause_return; fi
+        ;;
+      2)
+        print_warning "高危操作：将卸载并尝试恢复 SSH 配置。"
+        if confirm_prompt "确认继续吗？"; then run_menu_action cmd_uninstall --keep-certs --restore-ssh; else print_info "已取消卸载。"; pause_return; fi
+        ;;
+      3)
+        print_warning "高危操作：将卸载并尝试恢复 Nginx 配置。"
+        if confirm_prompt "确认继续吗？"; then run_menu_action cmd_uninstall --keep-certs --restore-nginx; else print_info "已取消卸载。"; pause_return; fi
+        ;;
+      4)
+        print_warning "高危操作：将卸载并同时尝试恢复 SSH 和 Nginx 配置。"
+        if confirm_prompt "确认继续吗？"; then run_menu_action cmd_uninstall --keep-certs --restore-ssh --restore-nginx; else print_info "已取消卸载。"; pause_return; fi
+        ;;
+      5) return 0 ;;
+      *) print_warning "无效选项，请输入 1-5 之间的数字。" ;;
+    esac
+  done
+}
+
 print_command_group() {
   local title="$1"; shift
   print_section "$title"
@@ -1889,56 +2339,17 @@ cmd_menu() {
     case "$c" in
       1) run_menu_action cmd_doctor ;;
       2) cmd_ssh_menu ;;
-      3) run_menu_action print_command_group "Nginx TCP 443 网关" \
-        "vps-gateway gateway-check" \
-        "vps-gateway gateway-install" \
-        "vps-gateway gateway-disable" \
-        "注意：如果 Reality 已占用 443，请使用 Reality 路由管理，不要强行安装通用网关。" ;;
+      3) cmd_gateway_menu ;;
       4) cmd_reality_menu ;;
-      5) run_menu_action print_command_group "内层 Nginx SNI 路由" \
-        "vps-gateway route-list" \
-        "vps-gateway route-add --sni 域名 --inner-port 8444 --backend 127.0.0.1:8000 --type vaultwarden --cert-domain 域名" \
-        "vps-gateway route-remove --sni 域名" \
-        "vps-gateway route-check --sni 域名" ;;
-      6) run_menu_action print_command_group "Vaultwarden 安全接入" \
-        "vps-gateway vaultwarden-detect" \
-        "vps-gateway vaultwarden-secure" \
-        "vps-gateway vaultwarden-route-add --sni 域名 --inner-port 8444 --backend 127.0.0.1:8000 --cert-domain 域名" \
-        "vps-gateway vaultwarden-admin-protect" \
-        "vps-gateway vaultwarden-backup" ;;
-      7) run_menu_action print_command_group "S-UI 安全接入" \
-        "vps-gateway sui-detect" \
-        "vps-gateway sui-secure" \
-        "vps-gateway sui-route-add --sni 域名 --inner-port 8445 --backend 127.0.0.1:端口 --cert-domain 域名" ;;
-      8) run_menu_action print_command_group "证书管理" \
-        "vps-gateway cert-set-cloudflare" \
-        "vps-gateway cert-issue --domain 域名 --email 邮箱" \
-        "vps-gateway cert-import --domain 域名 --cert /path/fullchain.pem --key /path/privkey.pem" \
-        "vps-gateway cert-status" \
-        "vps-gateway cert-renew" ;;
-      9) run_menu_action print_command_group "防火墙管理" \
-        "vps-gateway firewall-check" \
-        "vps-gateway firewall-stage" \
-        "vps-gateway firewall-confirm" \
-        "vps-gateway firewall-rollback" \
-        "高危提醒：未验证 SSH over 443 前不要关闭公网 22。" ;;
-      10) run_menu_action print_command_group "Fail2ban / 登录通知" \
-        "vps-gateway fail2ban-install" \
-        "vps-gateway fail2ban-config-ssh" \
-        "vps-gateway fail2ban-status" \
-        "vps-gateway login-notify-enable" \
-        "vps-gateway login-notify-disable" ;;
-      11) run_menu_action cmd_docker_check_exposure ;;
-      12) run_menu_action print_command_group "备份 / 回滚" \
-        "vps-gateway backup" \
-        "vps-gateway backup-list" \
-        "vps-gateway rollback --module ssh" \
-        "vps-gateway rollback --module nginx" \
-        "vps-gateway confirm nginx" \
-        "vps-gateway rollback-status" ;;
-      13) run_menu_action print_command_group "卸载 / 恢复" \
-        "vps-gateway uninstall --keep-certs --restore-ssh --restore-nginx" \
-        "卸载不会默认删除 Vaultwarden、S-UI 或证书数据。" ;;
+      5) cmd_route_menu ;;
+      6) cmd_vaultwarden_menu ;;
+      7) cmd_sui_menu ;;
+      8) cmd_cert_menu ;;
+      9) cmd_firewall_menu ;;
+      10) cmd_fail2ban_menu ;;
+      11) cmd_docker_menu ;;
+      12) cmd_backup_menu ;;
+      13) cmd_uninstall_menu ;;
       14) echo "已退出 VPS Gateway 管理面板。"; exit 0 ;;
       *) print_warning "无效选项，请输入 1-14 之间的数字。" ;;
     esac
