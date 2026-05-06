@@ -441,7 +441,15 @@ EOF
   write_file "$BASE_DIR/state/rollback.json" <<EOF
 {"tag":"$tag","module":"$module","snapshot":"$snap","delay":"$delay","created_at":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"}
 EOF
-  warn "已为 ${module} 安排 ${delay} 后自动回滚。验证成功后请执行：vps-gateway confirm ${tag}"
+  local menu_action_name="变更"
+  case "$tag" in
+    ssh) menu_action_name="SSH 变更" ;;
+    nginx) menu_action_name="Nginx 变更" ;;
+    routes) menu_action_name="路由变更" ;;
+    certs) menu_action_name="证书变更" ;;
+    firewall) menu_action_name="防火墙变更" ;;
+  esac
+  warn "已为 ${module} 安排 ${delay} 后自动回滚。验证成功后，可在当前菜单选择【确认 ${menu_action_name} 并取消自动回滚】，或执行：vps-gateway confirm ${tag}"
 }
 
 cancel_rollback() {
@@ -511,7 +519,7 @@ lint_generated_nginx_conf() {
   local has_error=0
   for f in "${files[@]}"; do
     if grep -qE 'listen\[' "$f"; then
-      print_error "检测到疑似错误写法 listen[ 在文件 $f 中，应为 listen [。"
+      print_error "检测到疑似错误写法 listen[ 在文件 $f 中，应为 listen[。"
       has_error=1
     fi
     if grep -qE '(^|[[:space:]])(listen127|listen0\.|server_name[A-Za-z0-9]|proxy_passhttp|proxy_pass127|ssl_certificate/|ssl_certificate_key/)' "$f"; then
@@ -946,7 +954,7 @@ EOF
 # Managed by vps-gateway. Public TCP 443 gateway.
 server {
     listen 0.0.0.0:443 reuseport;
-    listen [::]:443 reuseport;
+    listen[::]:443 reuseport;
     ssl_preread on;
     proxy_connect_timeout 10s;
     proxy_timeout 12h;
@@ -1354,10 +1362,11 @@ show_reality_menu() {
     print_menu_item 4 "删除 Reality SNI 路由"
     print_menu_item 5 "修改默认 Reality 后端"
     print_menu_item 6 "切换配置文件"
-    print_menu_item 7 "返回主菜单"
+    print_menu_item 7 "确认 Nginx 变更并取消自动回滚"
+    print_menu_item 8 "返回主菜单"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-7]: " c; then
+    if ! read -r -p "请选择操作 [1-8]: " c; then
       echo "已退出 Reality SNI 路由管理。"
       return 0
     fi
@@ -1400,8 +1409,9 @@ show_reality_menu() {
         file="${file//$'\r'/}"
         [[ -n "$file" ]] || file="$REALITY_CONF_DEFAULT"
         ;;
-      7) return 0 ;;
-      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
+      7) run_menu_action cancel_rollback nginx ;;
+      8) return 0 ;;
+      *) print_warning "无效选项，请输入 1-8 之间的数字。" ;;
     esac
   done
 }
@@ -2055,7 +2065,7 @@ cmd_firewall_stage() {
   warn "云厂商安全组也需要同步设置为只允许 TCP/UDP 443 入站。"
 }
 
-cmd_firewall_confirm() { cancel_rollback firewall; info "防火墙变更已确认。"; }
+cmd_firewall_confirm() { cancel_rollback firewall; info "防火墙变更已确认，并已取消自动回滚。"; }
 cmd_firewall_open() {
   require_root
   local port="" proto="tcp"
@@ -2310,10 +2320,11 @@ cmd_ssh_menu() {
     print_menu_item 3 "SSH 加固：禁用密码登录"
     print_menu_item 4 "SSH 内网化：监听 127.0.0.1:端口"
     print_menu_item 5 "检查 SSH 配置与监听端口"
-    print_menu_item 6 "返回主菜单"
+    print_menu_item 6 "确认 SSH 变更并取消自动回滚"
+    print_menu_item 7 "返回主菜单"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-6]: " c; then
+    if ! read -r -p "请选择操作 [1-7]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2361,12 +2372,9 @@ cmd_ssh_menu() {
         ensure_openssh_interactive || continue
         run_menu_action cmd_ssh_check
         ;;
-      6)
-        return 0
-        ;;
-      *)
-        print_warning "无效选项，请输入 1-6 之间的数字。"
-        ;;
+      6) run_menu_action cancel_rollback ssh ;;
+      7) return 0 ;;
+      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
     esac
   done
 }
@@ -2493,7 +2501,7 @@ install_nginx_org_repo() {
   run apt-get install -y curl gnupg ca-certificates lsb-release
   run mkdir -p /etc/apt/keyrings
   run sh -c "curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg"
-  run sh -c "printf 'deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
+  run sh -c "printf 'deb[signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' '$repo_url' '$codename' > /etc/apt/sources.list.d/nginx-org.list"
   run apt-get update
   run apt-get install -y nginx
 }
@@ -2711,7 +2719,7 @@ ensure_docker_interactive() {
     fi
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作[1-4]: " c; then
       return 1
     fi
     c="${c//$'\r'/}"
@@ -2807,10 +2815,11 @@ cmd_gateway_menu() {
     print_menu_item 1 "检查 Nginx stream / ssl_preread 支持"
     print_menu_item 2 "安装 / 启用 443 网关"
     print_menu_item 3 "禁用 443 网关"
-    print_menu_item 4 "返回上一级"
+    print_menu_item 4 "确认 Nginx 变更并取消自动回滚"
+    print_menu_item 5 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作 [1-5]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -2832,8 +2841,9 @@ cmd_gateway_menu() {
           pause_return
         fi
         ;;
-      4) return 0 ;;
-      *) print_warning "无效选项，请输入 1-4 之间的数字。" ;;
+      4) run_menu_action cancel_rollback nginx ;;
+      5) return 0 ;;
+      *) print_warning "无效选项，请输入 1-5 之间的数字。" ;;
     esac
   done
 }
@@ -2860,7 +2870,7 @@ prompt_cert_source_for_route() {
     print_menu_item 4 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-4]: " c; then
+    if ! read -r -p "请选择操作[1-4]: " c; then
       return 1
     fi
     c="${c//$'\r'/}"
@@ -2998,10 +3008,11 @@ cmd_route_menu() {
     print_menu_item 4 "检查指定路由"
     print_menu_item 5 "禁用指定路由"
     print_menu_item 6 "启用指定路由"
-    print_menu_item 7 "返回上一级"
+    print_menu_item 7 "确认路由变更并取消自动回滚"
+    print_menu_item 8 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-7]: " c; then
+    if ! read -r -p "请选择操作 [1-8]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -3040,8 +3051,9 @@ cmd_route_menu() {
         if ! sni="$(prompt_required "请输入要启用的 SNI 域名: ")"; then pause_return; continue; fi
         run_menu_action cmd_route_enable --sni "$sni"
         ;;
-      7) return 0 ;;
-      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
+      7) run_menu_action cancel_rollback routes ;;
+      8) return 0 ;;
+      *) print_warning "无效选项，请输入 1-8 之间的数字。" ;;
     esac
   done
 }
@@ -3054,10 +3066,11 @@ cmd_vaultwarden_menu() {
     print_menu_item 3 "添加 Vaultwarden SNI 路由"
     print_menu_item 4 "查看 /admin 加固建议"
     print_menu_item 5 "创建 Vaultwarden 备份元数据"
-    print_menu_item 6 "返回上一级"
+    print_menu_item 6 "确认路由变更并取消自动回滚"
+    print_menu_item 7 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-6]: " c; then
+    if ! read -r -p "请选择操作 [1-7]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -3088,8 +3101,9 @@ cmd_vaultwarden_menu() {
         ;;
       4) run_menu_action cmd_vaultwarden_admin_protect ;;
       5) run_menu_action cmd_vaultwarden_backup ;;
-      6) return 0 ;;
-      *) print_warning "无效选项，请输入 1-6 之间的数字。" ;;
+      6) run_menu_action cancel_rollback routes ;;
+      7) return 0 ;;
+      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
     esac
   done
 }
@@ -3102,10 +3116,11 @@ cmd_sui_menu() {
     print_menu_item 3 "检查 S-UI 暴露风险"
     print_menu_item 4 "添加 S-UI SNI 路由"
     print_menu_item 5 "删除 S-UI SNI 路由"
-    print_menu_item 6 "返回上一级"
+    print_menu_item 6 "确认路由变更并取消自动回滚"
+    print_menu_item 7 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-6]: " c; then
+    if ! read -r -p "请选择操作[1-7]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -3119,7 +3134,7 @@ cmd_sui_menu() {
         ensure_nginx_interactive || continue
         local sni="" inner_port="" backend=""
         if ! sni="$(prompt_required "请输入 S-UI 访问域名 SNI: ")"; then pause_return; continue; fi
-        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口 [默认 8445]: " "8445")"; then pause_return; continue; fi
+        if ! inner_port="$(prompt_port "请输入内层 Nginx 监听端口[默认 8445]: " "8445")"; then pause_return; continue; fi
         if ! backend="$(prompt_required "请输入 S-UI 后端地址，例如 127.0.0.1:2095: ")"; then pause_return; continue; fi
         prompt_cert_source_for_route "$sni" "sui" "$inner_port" "$backend"
         ;;
@@ -3134,8 +3149,9 @@ cmd_sui_menu() {
           pause_return
         fi
         ;;
-      6) return 0 ;;
-      *) print_warning "无效选项，请输入 1-6 之间的数字。" ;;
+      6) run_menu_action cancel_rollback routes ;;
+      7) return 0 ;;
+      *) print_warning "无效选项，请输入 1-7 之间的数字。" ;;
     esac
   done
 }
@@ -3151,10 +3167,11 @@ cmd_cert_menu() {
     print_menu_item 6 "续期证书"
     print_menu_item 7 "删除证书"
     print_menu_item 8 "查找常见证书路径"
-    print_menu_item 9 "返回上一级"
+    print_menu_item 9 "确认证书变更并取消自动回滚"
+    print_menu_item 10 "返回上一级"
     printf '\n'
     ui_line
-    if ! read -r -p "请选择操作 [1-9]: " c; then
+    if ! read -r -p "请选择操作 [1-10]: " c; then
       echo "已返回主菜单。"
       return 0
     fi
@@ -3222,8 +3239,9 @@ cmd_cert_menu() {
         fi
         ;;
       8) run_menu_action cmd_cert_find ;;
-      9) return 0 ;;
-      *) print_warning "无效选项，请输入 1-9 之间的数字。" ;;
+      9) run_menu_action cancel_rollback certs ;;
+      10) return 0 ;;
+      *) print_warning "无效选项，请输入 1-10 之间的数字。" ;;
     esac
   done
 }
@@ -3313,7 +3331,7 @@ cmd_firewall_menu() {
     print_banner "防火墙管理"
     print_menu_item 1 "查看防火墙状态"
     print_menu_item 2 "分阶段收紧：只允许 TCP/UDP 443 入站"
-    print_menu_item 3 "确认防火墙变更"
+    print_menu_item 3 "确认防火墙变更并取消自动回滚"
     print_menu_item 4 "回滚防火墙变更"
     print_menu_item 5 "手动开放端口"
     print_menu_item 6 "手动关闭端口"
@@ -3434,7 +3452,7 @@ cmd_backup_menu() {
     print_menu_item 2 "查看备份列表"
     print_menu_item 3 "查看待确认回滚状态"
     print_menu_item 4 "回滚指定模块"
-    print_menu_item 5 "确认并取消指定回滚任务"
+    print_menu_item 5 "确认变更并取消指定回滚任务"
     print_menu_item 6 "返回上一级"
     printf '\n'
     ui_line
@@ -3546,7 +3564,7 @@ show_main_menu() {
 cmd_menu() {
   while true; do
     show_main_menu
-    if ! read -r -p "请选择操作 [1-14]: " c; then
+    if ! read -r -p "请选择操作[1-14]: " c; then
       echo "已退出 VPS Gateway 管理面板。"
       exit 0
     fi
