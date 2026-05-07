@@ -954,7 +954,7 @@ EOF
 # Managed by vps-gateway. Public TCP 443 gateway.
 server {
     listen 0.0.0.0:443 reuseport;
-    listen[::]:443 reuseport;
+    listen [::]:443 reuseport;
     ssl_preread on;
     proxy_connect_timeout 10s;
     proxy_timeout 12h;
@@ -1096,8 +1096,8 @@ reality_backend_is_safe() {
 reality_require_conf() {
   local file="$1"
   [[ -f "$file" ]] || die "未找到 Reality stream 配置：$file"
-  grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$file" \
-    || die "配置文件不像预期的 backend_reality map：$file"
+  grep -Eq 'map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{' "$file" \
+    || die "配置文件未检测到 SNI map：map \$ssl_preread_server_name \$变量名 { ... }：$file"
 }
 
 cmd_reality_check() {
@@ -1109,7 +1109,7 @@ cmd_reality_check() {
   echo
   echo "当前 Reality SNI 路由："
   awk '
-    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; next}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{/ {inside=1; next}
     inside && /^[[:space:]]*\}/ {inside=0}
     inside && $1 !~ /^#/ && NF >= 2 {print}
   ' "$file"
@@ -1127,7 +1127,7 @@ cmd_reality_route_list() {
   file="$(reality_parse_file_arg "$@")"
   reality_require_conf "$file"
   awk '
-    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; next}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{/ {inside=1; next}
     inside && /^[[:space:]]*\}/ {inside=0}
     inside && $1 !~ /^#/ && NF >= 2 {gsub(/;/, "", $2); printf "%-36s %s\n", $1, $2}
   ' "$file"
@@ -1140,7 +1140,7 @@ reality_rewrite_route() {
   set +e
   awk -v sni="$sni" -v backend="$backend" -v mode="$mode" '
     BEGIN {inside=0; changed=0; inserted=0}
-    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; print; next}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{/ {inside=1; print; next}
     inside && /^[[:space:]]*\}/ {
       if (mode == "add" && !inserted) {
         printf "    %-34s %s;\n", sni, backend
@@ -1192,7 +1192,7 @@ reality_set_default_backend() {
   set +e
   awk -v backend="$backend" '
     BEGIN {inside=0; changed=0}
-    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$backend_reality[[:space:]]*\{/ {inside=1; print; next}
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{/ {inside=1; print; next}
     inside && /^[[:space:]]*\}/ {inside=0; print; next}
     inside && $1 == "default" {
       printf "    %-34s %s;\n", "default", backend
@@ -1360,7 +1360,7 @@ show_reality_menu() {
     print_menu_item 2 "查看 Reality SNI 路由"
     print_menu_item 3 "添加 / 更新 Reality SNI 路由"
     print_menu_item 4 "删除 Reality SNI 路由"
-    print_menu_item 5 "修改默认 Reality 后端"
+    print_menu_item 5 "修改 TLS SNI 默认后端"
     print_menu_item 6 "切换配置文件"
     print_menu_item 7 "确认 Nginx 变更并取消自动回滚"
     print_menu_item 8 "返回主菜单"
@@ -1401,7 +1401,7 @@ show_reality_menu() {
         ensure_reality_conf_interactive "$file" || continue
         file="$REALITY_SELECTED_FILE"
         local backend=""
-        read -r -p "请输入默认后端，例如 127.0.0.1:2443: " backend
+        read -r -p "请输入 TLS SNI 默认后端，例如 127.0.0.1:2443: " backend
         run_menu_action cmd_reality_route_set_default --file "$file" --backend "$backend"
         ;;
       6)
@@ -1576,7 +1576,7 @@ add_stream_route_line() {
   local sni="$1" inner_port="$2"
 
   if [[ -f "$REALITY_CONF_DEFAULT" ]] \
-    && grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$REALITY_CONF_DEFAULT" \
+    && grep -Eq 'map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{' "$REALITY_CONF_DEFAULT" \
     && grep -Eq 'listen[[:space:]].*443' "$REALITY_CONF_DEFAULT"; then
     reality_rewrite_route "$REALITY_CONF_DEFAULT" "$sni" "127.0.0.1:${inner_port}" "add"
     return 0
@@ -1597,7 +1597,7 @@ add_stream_route_backend_line() {
   local sni="$1" backend="$2"
 
   if [[ -f "$REALITY_CONF_DEFAULT" ]] \
-    && grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$REALITY_CONF_DEFAULT" \
+    && grep -Eq 'map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{' "$REALITY_CONF_DEFAULT" \
     && grep -Eq 'listen[[:space:]].*443' "$REALITY_CONF_DEFAULT"; then
     reality_rewrite_route "$REALITY_CONF_DEFAULT" "$sni" "$backend" "add"
     return 0
@@ -1618,7 +1618,7 @@ remove_stream_route_line() {
   local sni="$1"
 
   if [[ -f "$REALITY_CONF_DEFAULT" ]] \
-    && grep -q 'map[[:space:]]\+\$ssl_preread_server_name[[:space:]]\+\$backend_reality' "$REALITY_CONF_DEFAULT" \
+    && grep -Eq 'map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{' "$REALITY_CONF_DEFAULT" \
     && grep -Eq "^[[:space:]]*${sni//./\\.}[[:space:]]+" "$REALITY_CONF_DEFAULT"; then
     reality_rewrite_route "$REALITY_CONF_DEFAULT" "$sni" "" "remove"
     return 0
